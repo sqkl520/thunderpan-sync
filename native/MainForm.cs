@@ -780,7 +780,36 @@ namespace ThunderPanSync
 
             if (phase == "done")
             {
-                SetProgressIdle("完成 · 共 " + total + " 个文件");
+                // "完成"这个词必须与实际结果一致。
+                // done 事件里 total = uploaded + failed，若整轮全失败，
+                // 原实现会显示"完成 · 共 10 个文件"——纯属说谎。
+                int up = GetInt(d, "uploaded", -1);
+                int bad = GetInt(d, "failed", -1);
+                if (up < 0 || bad < 0)
+                {
+                    // 老引擎没给这两个字段，退回中性措辞，不硬说"完成"
+                    SetProgressIdle("本轮结束 · 共 " + total + " 个文件");
+                }
+                else if (bad == 0)
+                {
+                    SetProgressIdle("完成 · 成功 " + up + " 个文件");
+                }
+                else if (up == 0)
+                {
+                    _lblProgress.Text = "本轮失败 " + bad + " 个文件（详见下方失败列表）";
+                    _lblProgress.ForeColor = Color.Salmon;
+                }
+                else
+                {
+                    _lblProgress.Text = "部分成功 · 成功 " + up + "，失败 " + bad
+                        + "（详见下方失败列表）";
+                    _lblProgress.ForeColor = Color.Gold;
+                }
+                if (bad == 0)
+                {
+                    try { _progress.Value = 1000; } catch { }
+                    _lblProgress.ForeColor = Color.LightGreen;
+                }
                 return;
             }
             if (phase == "scanning")
@@ -987,12 +1016,28 @@ namespace ThunderPanSync
                     bool running = st.ContainsKey("running") && Convert.ToBoolean(st["running"]);
                     _engineRunning = running;
 
-                    // 状态显示必须诚实。三态而非两态：
-                    //   备份中   (绿) —— 引擎在跑
-                    //   未在备份 (红) —— 有目录但没跑，这是最危险的静默状态，必须刺眼
+                    // 熔断态必须单独显示。
+                    // circuitOpen / pausedReason / consecutiveFailures 早就由 getStatus() 返回，
+                    // 但界面一个字段都没读 —— 熔断期间 running 仍为 true，
+                    // 于是显示绿色「● 备份中」，而引擎只是每 5 分钟打一条"已熔断"的 warn。
+                    // 这是"界面说谎"的同类复发，比进度条严重得多。
+                    bool circuitOpen = st.ContainsKey("circuitOpen")
+                        && Convert.ToBoolean(st["circuitOpen"]);
+                    int consecFail = GetInt(st, "consecutiveFailures", 0);
+
+                    // 状态显示必须诚实。四态：
+                    //   已熔断   (红) —— 连续失败已暂停自动重试，必须刺眼
+                    //   备份中   (绿) —— 引擎在跑且未熔断
+                    //   未在备份 (红) —— 有目录但没跑
                     //   未配置   (黄) —— 还没有监视目录
                     bool hasDirs = _lvDirs.Items.Count > 0;
-                    if (running)
+                    if (circuitOpen)
+                    {
+                        _lblState.Text = "● 已暂停（连续失败 " + consecFail
+                            + " 轮，点「立即同步」重试）";
+                        _lblState.ForeColor = Color.Salmon;
+                    }
+                    else if (running)
                     {
                         _lblState.Text = "● 备份中";
                         _lblState.ForeColor = Color.LightGreen;

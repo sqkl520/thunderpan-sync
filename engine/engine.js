@@ -848,12 +848,36 @@ class SyncEngine extends EventEmitter {
   // 等待 targetName 对应的、且 id 不在 before 集合里的文件出现
   // 同时校验大小（防止把同名的其他新文件误认成本次的）
   async _verifyRemoteFile(name, size, beforeIds) {
+    // 快照无效时**不能**判成功。
+    //
+    // 这是"静默丢数据"的最后一个入口（红队实测出的）：
+    // _snapshotIds 在分页失败/网络抖动时返回空 Set（不是抛异常），
+    // 而 `beforeIds && beforeIds.has(...)` 对空 Set 恒为 false ⇒
+    // 云端任何一个同名同大小的旧文件都会被当成本次上传成功 ⇒
+    // 写进 state.uploaded ⇒ 该文件此后再也不重传。
+    // 用户改了内容但字节数没变（等长文本、定长记录、同大小替换）就会永久漏备。
+    //
+    // 删除侧早就有 `beforeIds.size === 0` 防护（_deleteOldVersions），
+    // 核查侧却没有 —— 同一个空集，一个方向安全、另一个方向丢数据。现在对齐。
+    if (!beforeIds || beforeIds.size === 0) {
+      // 目录确实是空的时候，快照也会是空集。这时无法区分"目录空"和"快照失败"，
+      // 所以额外查一次：只有确认目录为空，才允许用"新出现"以外的判据。
+      const reallyEmpty = await this._remoteFolderIsEmpty();
+      if (!reallyEmpty) {
+        this.log('warn', `${name} 的云端快照不可用（目录非空），无法确认本次上传是否入库；`
+          + '按"未核实"处理，下一轮会重试（不会误记为已备份）', 'NETWORK');
+        return false;
+      }
+      // 目录确实为空：此时任何同名同大小文件都只可能是刚传上去的
+    }
+
     for (let attempt = 0; attempt < 6; attempt++) {
       if (attempt > 0) await new Promise(r => setTimeout(r, 3000));
       try {
         if (!this.remoteFolderId) return false;
 
         let token = '';
+        let sawPages = 0;
         for (let page = 0; page < 20; page++) {
           let url = API + '/drive/v1/files?parent_id=' + encodeURIComponent(this.remoteFolderId) + '&limit=200';
           if (token) url += '&page_token=' + encodeURIComponent(token);
@@ -861,6 +885,7 @@ class SyncEngine extends EventEmitter {
           if (!r || r.status !== 200) break;
           const j = await r.json();
           const files = j.files || [];
+          sawPages++;
 
           for (const f of files) {
             if (Number(f.size) !== Number(size)) continue;
@@ -870,7 +895,7 @@ class SyncEngine extends EventEmitter {
             if (!isSameName && !isRenamed) continue;
 
             // 核心判据：id 必须是本次新出现的
-            if (beforeIds && beforeIds.has(f.id)) {
+            if (beforeIds && beforeIds.size > 0 && beforeIds.has(f.id)) {
               // 这是上传前就存在的旧文件，不能算本次成功
               continue;
             }
@@ -889,6 +914,24 @@ class SyncEngine extends EventEmitter {
       }
     }
     return false;
+  }
+
+  // 云端目标目录是否确实为空。
+  // 用途：区分"目录真的是空的（快照空集是正常的）"与"快照查询失败（空集是假的）"。
+  // 只有前者才允许在没有 beforeIds 的情况下判定上传成功。
+  async _remoteFolderIsEmpty() {
+    try {
+      if (!this.remoteFolderId) return false;
+      const url = API + '/drive/v1/files?parent_id='
+        + encodeURIComponent(this.remoteFolderId) + '&limit=1';
+      const r = await this._apiGet(url);
+      if (!r || r.status !== 200) return false;
+      const j = await r.json();
+      const files = j.files || [];
+      return files.length === 0;
+    } catch (e) {
+      return false;
+    }
   }
 
   // "report.txt" 被云盘重命名后是 "report(1).txt" / "report(2).txt"
@@ -1298,9 +1341,16 @@ class SyncEngine extends EventEmitter {
         name: '', size: 0,
         // 收尾事件也要给出本轮的字节基数，否则界面进度条停在最后一条 uploading
         // 的百分比（或显示 0/0），看起来像"卡住没完成"。
-        bytesDone: stats.bytesTotal || 0,
+        //
+        // 但 bytesDone 只能用**成功**的字节数（stats.bytesUploaded），
+        // 不能用 bytesTotal —— 后者含失败文件的字节，会让进度条走到 100%
+        // 而实际有文件没传上去，配合界面上的"完成"二字就是说谎。
+        bytesDone: stats.bytesUploaded || 0,
         bytesTotal: stats.bytesTotal || 0,
         elapsedMs: stats.durationMs, etaMs: 0,
+        // 明确告诉界面本轮有几成成功，界面据此决定说"完成"还是"有失败"
+        uploaded: stats.uploaded,
+        failed: stats.failed,
       });
       this.emit('run-complete', stats);
       this.log('info', `[${runId}] 完成: 上传 ${stats.uploaded}, 失败 ${stats.failed}, 跳过 ${stats.skipped}, ${stats.durationMs}ms`);
@@ -1402,13 +1452,39 @@ class SyncEngine extends EventEmitter {
       : '已停止');
   }
 
-  // 用户手动"立即同步"：解除熔断并清掉退避计数，然后跑一轮。
+  // 用户手动"立即同步"：允许在熔断态下跑一轮。
   // 熔断的定义是"停止自动重试"，不是"禁止用户操作"。
+  //
+  // 关键：**不能**在这里无条件清零熔断标志。
+  // 原实现先 clear 再跑，而 _applyBackoff(manual=true) 又直接 return 不回升计数 ⇒
+  // 只要用户点一次"立即同步"（哪怕这一轮照样失败），熔断就永久解除、
+  // 之后自动同步按正常间隔一直重试。熔断语义被"点一下"废掉。
+  // 现在改为：先跑，跑成功才解除；失败则恢复原来的熔断状态。
   async runNow() {
-    this.circuitOpen = false;
-    this.consecutiveFailures = 0;
-    this.nextRunAt = null;
-    return this.runOnce({ manual: true });
+    const wasOpen = this.circuitOpen;
+    const savedFailures = this.consecutiveFailures;
+    this.circuitOpen = false;          // 临时放行，让 runOnce 不被自己挡住
+    let stats = null;
+    try {
+      stats = await this.runOnce({ manual: true });
+    } catch (e) {
+      stats = null;
+    }
+    const roundFailed = !stats || (stats.failed > 0 && stats.uploaded === 0);
+    if (roundFailed) {
+      // 手动这轮也失败：恢复熔断，不要把用户的"点一下"当成问题已解决
+      this.circuitOpen = wasOpen;
+      this.consecutiveFailures = Math.max(savedFailures, this.consecutiveFailures);
+      if (this.circuitOpen) {
+        this.log('warn', '手动同步仍然失败，保持暂停状态（自动重试仍关闭）', 'UNKNOWN');
+      }
+    } else {
+      this.consecutiveFailures = 0;
+      this.circuitOpen = false;
+      this.nextRunAt = null;
+      this.log('info', '手动同步成功，已恢复自动重试', 'UNKNOWN');
+    }
+    return stats;
   }
 
   getStatus() {
