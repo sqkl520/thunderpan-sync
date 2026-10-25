@@ -1,0 +1,24 @@
+{
+  "name": "thunderpan-sync",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Watch local folders and back them up to Xunlei Cloud Drive automatically",
+  "license": "MIT",
+  "author": "ThunderPanSync contributors",
+  "main": "engine/host.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node engine/host.js",
+    "build": "powershell -NoProfile -ExecutionPolicy Bypass -File build-native.ps1"
+  },
+  "dependencies": {},
+  "dependencies_note": [
+    "引擎零第三方依赖：",
+    "  - CDP 客户端（engine/cdp.js）用 Node 内置 WebSocket + http，不用 playwright",
+    "  - 界面是 C# WinForms 原生控件，不用 Electron",
+    "  - HTTP 请求用内置 fetch",
+    "runtime/node.exe 打包时从本机 Node 复制，随包分发（MIT，见 THIRD_PARTY_NOTICES.md）"
+  ]
+}

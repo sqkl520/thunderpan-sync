@@ -1,0 +1,129 @@
+param(
+  [switch]$SkipInstaller,
+  [switch]$RunAfterBuild
+)
+
+# build-native.ps1 -- one-click build for the native app + installer
+#
+# NOTE: this script is pure ASCII on purpose.
+#   Windows PowerShell 5.1 reads a BOM-less .ps1 as the system ANSI codepage (GBK on
+#   this machine). Any non-ASCII character in the script body (even inside a comment)
+#   can be mis-decoded and corrupt following tokens. We hit exactly this: a comment
+#   containing Chinese turned the string 'error|Error' into garbage and broke the
+#   build. Keep this file ASCII-only; put localized strings in the C# app instead.
+#
+# Pitfalls encoded here (all previously hit):
+#   1. makensis needs the .nsi to be UTF-8 WITH BOM, else "Bad text encoding".
+#      Editors drop the BOM, so we re-add it every build.
+#   2. csc.exe only supports C# 5; /out and /target must precede source files.
+#   3. NSIS "File /r" flattens directories; the install layout uses explicit SetOutPath.
+#   4. The install directory is read-only for users; data goes to %APPDATA% (C# side).
+#   5. PowerShell reserves $args; param() must be the first statement.
+
+$ErrorActionPreference = 'Stop'
+$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Csc = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+$MakeNsis = "$env:LOCALAPPDATA\electron-builder\Cache\nsis-3.0.4.1\nsis-3.0.4.1-1mpw4\makensis.exe"
+
+function Step($n, $msg) { Write-Host ""; Write-Host "[$n] $msg" -ForegroundColor Cyan }
+
+# ---------- 1. compile C# ----------
+Step 1 'Compile native C# UI'
+$native = Join-Path $Root 'native'
+$exe = Join-Path $native 'ThunderPanSync.exe'
+$srcs = @('Program.cs', 'MainForm.cs', 'EngineHost.cs', 'BrowserManager.cs') | ForEach-Object { Join-Path $native $_ }
+foreach ($s in $srcs) { if (-not (Test-Path $s)) { throw "missing source: $s" } }
+
+$cscArgs = @('/nologo', '/target:winexe', "/out:$exe",
+  '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll', '/r:System.Web.Extensions.dll',
+  '/r:System.Net.Http.dll',
+  '/optimize+') + $srcs
+$out = & $Csc @cscArgs 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) {
+  foreach ($ln in ($out -split "`n")) {
+    if ($ln -match 'error') { Write-Host ('  ' + $ln.Trim()) -ForegroundColor Red }
+  }
+  throw 'C# compile failed'
+}
+Write-Host ('  OK  {0:N0} B' -f (Get-Item $exe).Length) -ForegroundColor Green
+
+# ---------- 2. assemble publish dir ----------
+Step 2 'Assemble publish directory'
+$pub = Join-Path $native 'publish'
+
+Get-Process -Name 'ThunderPanSync' -ErrorAction SilentlyContinue | ForEach-Object {
+  Write-Host ('  stopping running instance pid={0}' -f $_.Id) -ForegroundColor Yellow
+  try { $_.Kill(); $_.WaitForExit(3000) } catch { }
+}
+Start-Sleep -Milliseconds 500
+
+if (Test-Path $pub) {
+  try { Remove-Item $pub -Recurse -Force }
+  catch {
+    $stale = "$pub.stale-$(Get-Date -Format 'HHmmss')"
+    Write-Host ('  locked, renaming to ' + (Split-Path $stale -Leaf)) -ForegroundColor Yellow
+    Move-Item $pub $stale -ErrorAction SilentlyContinue
+  }
+}
+New-Item -ItemType Directory $pub -Force | Out-Null
+New-Item -ItemType Directory (Join-Path $pub 'runtime') -Force | Out-Null
+New-Item -ItemType Directory (Join-Path $pub 'engine\engine') -Force | Out-Null
+
+Copy-Item $exe $pub
+$nodeExe = (Get-Command node).Source
+if (-not (Test-Path $nodeExe)) { throw 'node.exe not found' }
+Copy-Item $nodeExe (Join-Path $pub 'runtime\node.exe')
+Copy-Item (Join-Path $Root 'host.js') (Join-Path $pub 'engine')
+Copy-Item (Join-Path $Root 'paths.js') (Join-Path $pub 'engine')
+Copy-Item (Join-Path $Root 'engine\engine.js') (Join-Path $pub 'engine\engine')
+Copy-Item (Join-Path $Root 'engine\cdp.js') (Join-Path $pub 'engine\engine')
+
+$sum = (Get-ChildItem $pub -Recurse -File | Measure-Object Length -Sum).Sum
+Write-Host ('  OK  {0:N1} MB' -f ($sum / 1MB)) -ForegroundColor Green
+
+# ---------- 3. build installer ----------
+if (-not $SkipInstaller) {
+  Step 3 'Build NSIS installer'
+  if (-not (Test-Path $MakeNsis)) { throw "makensis not found: $MakeNsis" }
+
+  $nsi = Join-Path $Root 'installer.nsi'
+  $bytes = [IO.File]::ReadAllBytes($nsi)
+  $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+  if (-not $hasBom) {
+    Write-Host '  adding UTF-8 BOM to installer.nsi' -ForegroundColor Yellow
+    $text = [IO.File]::ReadAllText($nsi, (New-Object Text.UTF8Encoding $false))
+    [IO.File]::WriteAllText($nsi, $text, (New-Object Text.UTF8Encoding $true))
+  }
+
+  New-Item -ItemType Directory (Join-Path $Root 'release') -Force | Out-Null
+  Push-Location $Root
+  try {
+    $nout = & $MakeNsis /V2 installer.nsi 2>&1 | Out-String
+    $code = $LASTEXITCODE
+  } finally { Pop-Location }
+
+  if ($code -ne 0) {
+    foreach ($ln in ($nout -split "`n")) {
+      if ($ln -match 'rror') { Write-Host ('  ' + $ln.Trim()) -ForegroundColor Red }
+    }
+    throw 'NSIS compile failed'
+  }
+
+  $setup = Join-Path $Root 'release\ThunderPanSync-Setup-1.0.0.exe'
+  Write-Host ('  OK  {0:N1} MB' -f ((Get-Item $setup).Length / 1MB)) -ForegroundColor Green
+}
+
+# ---------- 4. summary ----------
+Step 4 'Artifacts'
+Write-Host ('  native exe    {0,12:N0} B' -f (Get-Item $exe).Length)
+$setup = Join-Path $Root 'release\ThunderPanSync-Setup-1.0.0.exe'
+if (Test-Path $setup) {
+  Write-Host ('  installer     {0,12:N1} MB' -f ((Get-Item $setup).Length / 1MB))
+}
+Write-Host '  (electron build was 239 MB exe / 118.9 MB installer)'
+
+if ($RunAfterBuild) {
+  Step 5 'Launch'
+  Start-Process (Join-Path $pub 'ThunderPanSync.exe')
+  Write-Host '  started'
+}

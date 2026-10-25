@@ -1,0 +1,36 @@
+# Build outputs (large, must not enter repo)
+release/
+native/publish/
+native/*.exe
+
+# Dependencies
+node_modules/
+
+# Runtime data - must NEVER enter the repo
+data/
+profile/
+*.log
+*.err
+state.json
+config.json
+*.tmp
+*.corrupt-*
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# Temp / backup files
+*.bak
+*.orig
+*.rej
+
+# NOTE: never add a bare directory name like "ThunderPanSync/" here.
+# git is case-insensitive on Windows, so such a rule silently swallows the
+# shipped subdirectory (hit this exact trap once).
+# Electron-era implementation, superseded by the native build; kept locally only.
+legacy-electron/
