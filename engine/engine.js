@@ -1004,7 +1004,11 @@ class SyncEngine extends EventEmitter {
   // etaMs 在不该有值时一律给 null，不要给 0（0 会显示成"马上完成"，是撒谎）。
   _emitProgress(p) {
     try {
-      this.emit('progress', {
+      // 字段白名单：只透传约定好的字段，避免把内部状态泄漏到 UI 层。
+      // 注意 uploaded/failed 必须放行 —— 它们只在 done 事件里有意义，
+      // 界面靠它们决定说"完成"还是"有失败"。曾漏过这两个字段，
+      // 导致界面上刚写好的「完成 / 部分成功 / 本轮失败」三分支全成了死代码。
+      var out = {
         phase: p.phase || 'uploading',
         index: Number(p.index) || 0,
         total: Number(p.total) || 0,
@@ -1014,7 +1018,11 @@ class SyncEngine extends EventEmitter {
         bytesTotal: Number(p.bytesTotal) || 0,
         elapsedMs: Number(p.elapsedMs) || 0,
         etaMs: (p.etaMs === null || p.etaMs === undefined) ? null : Number(p.etaMs),
-      });
+      };
+      // 只有确实带了才透传，免得旧界面读到 0 会误判"全部失败"
+      if (p.uploaded !== undefined && p.uploaded !== null) out.uploaded = Number(p.uploaded);
+      if (p.failed !== undefined && p.failed !== null) out.failed = Number(p.failed);
+      this.emit('progress', out);
     } catch (e) {
       // 事件监听器抛错不能拖垮同步主流程（但也不能静默）
       this.log('warn', `进度事件派发失败: ${e.message}`, 'UNKNOWN');

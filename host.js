@@ -33,9 +33,33 @@ const path = require('path');
 const P = require('./paths');
 const { SyncEngine } = require('./engine/engine');
 
+// 补全并收敛配置。
+// 直接返回磁盘上的 JSON 会让"旧 config 缺字段"变成 undefined 一路传下去：
+// status 命令会报 versionsMode: undefined，而引擎内部实际按 keep 运行 ——
+// 界面读到的和真正生效的不一致。这里统一补齐，只有一处默认值。
+function normalizeConfig(raw) {
+  var c = (raw && typeof raw === 'object') ? raw : {};
+  var out = {
+    watchDirs: Array.isArray(c.watchDirs) ? c.watchDirs : [],
+    remoteFolderName: c.remoteFolderName || 'ThunderPanSync',
+    intervalMs: Number(c.intervalMs) > 0 ? Number(c.intervalMs) : 60000,
+    settleMs: (c.settleMs === 0 || Number(c.settleMs) > 0) ? Number(c.settleMs) : 5000,
+    maxSizeMB: Number(c.maxSizeMB) > 0 ? Number(c.maxSizeMB) : 2048,
+    autoStartBrowser: c.autoStartBrowser !== false,
+    // 云端版本策略：keep = 绝不动云端旧文件（默认）；replace = 用户显式开启才删旧副本
+    versionsMode: (c.versionsMode === 'replace') ? 'replace' : 'keep',
+    maxDeletePerRun: (Number(c.maxDeletePerRun) >= 0 && Number(c.maxDeletePerRun) <= 200)
+      ? Number(c.maxDeletePerRun) : 20,
+  };
+  if (c.enabled === true) out.enabled = true;
+  return out;
+}
+
 function loadConfig() {
   try {
-    if (fs.existsSync(P.CONFIG_FILE)) return JSON.parse(fs.readFileSync(P.CONFIG_FILE, 'utf8'));
+    if (fs.existsSync(P.CONFIG_FILE)) {
+      return normalizeConfig(JSON.parse(fs.readFileSync(P.CONFIG_FILE, 'utf8')));
+    }
   } catch (e) {
     // 配置读坏了不能静默用默认值：用户会以为监视列表还在，实际一个文件都不备份
     try {

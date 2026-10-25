@@ -810,6 +810,22 @@ namespace ThunderPanSync
                     try { _progress.Value = 1000; } catch { }
                     _lblProgress.ForeColor = Color.LightGreen;
                 }
+                else if (bad < 0)
+                {
+                    // 老引擎缺字段：不知道成败，就保持中性，既不说成功也不报假失败
+                    try { _progress.Value = 0; } catch { }
+                }
+                else
+                {
+                    // 有失败时进度条不能停在"看起来快完成"的位置，也不能归零装作没事。
+                    // 设成一个明确的"未完成"值并把颜色标红，避免"满格后归零=成功"的误读。
+                    try { _progress.Value = Math.Min(_progress.Maximum, 999); } catch { }
+                    try
+                    {
+                        _progress.ForeColor = Color.Salmon;
+                    }
+                    catch { }
+                }
                 return;
             }
             if (phase == "scanning")
@@ -875,7 +891,11 @@ namespace ThunderPanSync
             try { _progress.Value = 0; } catch { }
             if (_lblProgress != null)
             {
-                _lblProgress.ForeColor = Color.Gray;
+                // 只有"真的没事"时才用灰色。带失败信息时保持调用方设的告警色，
+                // 否则会出现"进度满格→归零→灰色中性文本"的成功错觉（实测复现过）。
+                bool looksLikeFailure = !string.IsNullOrEmpty(text)
+                    && (text.IndexOf("失败") >= 0 || text.IndexOf("未完成") >= 0);
+                if (!looksLikeFailure) _lblProgress.ForeColor = Color.Gray;
                 _lblProgress.Text = string.IsNullOrEmpty(text) ? "空闲" : text;
             }
         }
