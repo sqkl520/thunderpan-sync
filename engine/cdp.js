@@ -15,6 +15,81 @@
 //   page.locator('input[type=file]').setInputFiles(path)
 //   page.evaluate(fn, arg)
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+// ---------------- 调试端口解析（动态端口） ----------------
+//
+// 为什么引擎侧要读文件而不是硬编码 9222：
+//   CDP 端口没有认证，谁先占住 9222 谁就能冒充浏览器。所以 C# 侧
+//   （native/BrowserManager.cs）会先探测 9222，若被本应用以外的程序占用就回退到
+//   9223..9233，并把**实际端口**写进 %APPDATA%\ThunderPanSync\cdp-port.txt。
+//   引擎必须读这个文件，否则 BrowserManager 换了端口而引擎仍连 9222 → 全部上传失败。
+//
+// 兼容性铁律：读不到文件 / 读到的内容不是合法端口 → 回退 9222。
+//   （老版本没有这个文件，删掉也必须能跑。）
+const DEFAULT_CDP_PORT = 9222;
+const PORT_FILE_NAME = 'cdp-port.txt';
+
+// 可能是数据目录的所有候选：环境变量 > paths.js 的 DATA_DIR > %APPDATA%\ThunderPanSync
+function portFileCandidates() {
+  const dirs = [];
+  if (process.env.PANSYNC_DATA_DIR) dirs.push(process.env.PANSYNC_DATA_DIR);
+  try {
+    const P = require('../paths');
+    if (P && P.DATA_DIR) dirs.push(P.DATA_DIR);
+    // paths.js 在开发态可能指向 <src>/data，而 C# 始终写 %APPDATA%。
+    // 所以即便 P.DATA_DIR 命中，也要把 %APPDATA% 作为兜底候选。
+  } catch (e) { /* 没有 paths.js 也要能工作 */ }
+  const ad = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  dirs.push(path.join(ad, 'ThunderPanSync'));
+
+  const seen = {};
+  const files = [];
+  for (const d of dirs) {
+    if (!d) continue;
+    const key = String(d).toLowerCase();
+    if (seen[key]) continue;
+    seen[key] = true;
+    files.push(path.join(d, PORT_FILE_NAME));
+  }
+  return files;
+}
+
+// 读 cdp-port.txt 得到端口。任何异常/非法内容一律回退 9222。
+function readCdpPort() {
+  for (const f of portFileCandidates()) {
+    try {
+      if (!fs.existsSync(f)) continue;
+      const raw = fs.readFileSync(f, 'utf8');
+      // 允许 BOM / 空白 / 尾部换行；只接受纯数字
+      const txt = String(raw).replace(/^\uFEFF/, '').trim();
+      const m = /^(\d{1,5})$/.exec(txt);
+      if (!m) continue;                    // 内容非法：换下一个候选，最终回退 9222
+      const p = parseInt(m[1], 10);
+      if (p <= 0 || p > 65535) continue;
+      return p;
+    } catch (e) { /* 文件被占用/无权限：继续下一个候选 */ }
+  }
+  return DEFAULT_CDP_PORT;
+}
+
+// 引擎侧统一从这里取 CDP 地址（每次调用都重新读，避免"启动早于 C# 写文件"的竞态）
+function getCdpUrl() {
+  return 'http://127.0.0.1:' + readCdpPort();
+}
+
+// engine.js 传入的是历史硬编码 'http://127.0.0.1:9222'；当它仍是默认值时，
+// 说明调用方没有显式指定端口，此时必须以 cdp-port.txt 为准。
+// 显式传入其它地址（测试用假地址）时尊重调用方。
+function resolveDebugUrl(url) {
+  if (!url) return getCdpUrl();
+  const m = /^(?:https?:\/\/)?(?:127\.0\.0\.1|localhost):(\d+)\/?$/i.exec(String(url).trim());
+  if (m && parseInt(m[1], 10) === DEFAULT_CDP_PORT) return getCdpUrl();
+  if (m) return String(url).trim();
+  return String(url).trim();
+}
 
 function httpGetJson(url) {
   return new Promise(function (resolve, reject) {
@@ -200,11 +275,65 @@ class Context {
 // ---------------- CDP 连接池 ----------------
 class Cdp {
   constructor(debugUrl) {
-    this.debugUrl = debugUrl || 'http://127.0.0.1:9222';
+    // 不再无条件信任调用方给的字面 9222：动态端口由 BrowserManager 写在 cdp-port.txt，
+    // 见文件开头的 readCdpPort()。显式传入非 9222 的地址时尊重调用方（测试/调试用）。
+    this.debugUrl = resolveDebugUrl(debugUrl);
     this.sessions = new Map();   // wsUrl -> { ws, nextId, pending }
     this._pages = [];
     this.ctx = new Context(this);
     this.browser = new Browser(this);
+  }
+
+  // 防冒充：确认端点确实是 Edge/Chrome 的真 CDP 服务。
+  //
+  // 为什么需要这一层（红队实测出的攻击）：cdp-port.txt 可被本机任意程序改写指向假 CDP。
+  // 假服务只要返回 {"Browser":"Edg/120..."} 就能通过原来那个前缀检查，
+  // 然后返回伪造的 /json/list，让 _verifyRemoteFile 认定"云端已有该文件" ——
+  // 界面显示上传成功、云端什么都没有（静默丢数据），
+  // 而且 setInputFiles 会把待备份文件的本地路径交给对方。
+  //
+  // 所以不能只信字符串，还要验证 CDP 的协议级特征：
+  //   1. /json/version 必须同时给出 webSocketDebuggerUrl（真 CDP 一定有）
+  //   2. /json/list 每一项必须是 {id,type,url,webSocketDebuggerUrl} 结构
+  //   3. 真浏览器的 /json/version 一定带 "Protocol-Version"（Chromium 的固定字段）
+  async assertRealBrowser() {
+    const ver = await this.callHttp('/json/version', 'GET');
+    if (!ver || typeof ver !== 'object') {
+      throw new Error('CDP 端点返回了非 JSON 的 /json/version，已拒绝连接 ' + this.debugUrl);
+    }
+    const b = String(ver.Browser || '');
+    const proto = String(ver['Protocol-Version'] || '');
+    const ws = String(ver.webSocketDebuggerUrl || '');
+
+    if (!/^(Edg|Chrome)\//i.test(b)) {
+      throw new Error('CDP 端点不是浏览器（Browser="' + b + '"），可能被其他程序冒充；已拒绝连接 '
+        + this.debugUrl);
+    }
+    // Chromium 的 /json/version 必然带 Protocol-Version（形如 "1.3"）与浏览器级 ws 地址。
+    // 假服务常常只伪造 Browser 字段。
+    if (!/^\d+\.\d+$/.test(proto)) {
+      throw new Error('CDP 端点缺少合法的 Protocol-Version（got "' + proto
+        + '"），疑似冒充；已拒绝连接 ' + this.debugUrl);
+    }
+    if (!/^wss?:\/\//i.test(ws)) {
+      throw new Error('CDP 端点缺少 webSocketDebuggerUrl，疑似冒充；已拒绝连接 ' + this.debugUrl);
+    }
+
+    // /json/list 的结构校验：真 CDP 的每项都有 id/type/webSocketDebuggerUrl
+    const list = await this.callHttp('/json/list', 'GET');
+    if (!Array.isArray(list)) {
+      throw new Error('CDP /json/list 不是数组，疑似冒充；已拒绝连接 ' + this.debugUrl);
+    }
+    for (const t of list) {
+      if (!t || typeof t !== 'object') {
+        throw new Error('CDP /json/list 含非法项，疑似冒充；已拒绝连接 ' + this.debugUrl);
+      }
+      if (!t.id || !t.type || !t.webSocketDebuggerUrl) {
+        throw new Error('CDP /json/list 项缺少 id/type/webSocketDebuggerUrl，疑似冒充；已拒绝连接 '
+          + this.debugUrl);
+      }
+    }
+    return b;
   }
 
   callHttp(pathAndQuery, method) {
@@ -347,6 +476,14 @@ class Cdp {
   pages() { return this._pages.slice(); }
 
   async connect() {
+    // 再解析一次端口：引擎可能在 C# 写完 cdp-port.txt 之前就把 Cdp 构造出来了
+    // （EngineHost 先起 node，BrowserManager 的端口探测稍后才落盘）。
+    // resolveDebugUrl 是幂等的：已经是显式非 9222 地址就原样返回。
+    this.debugUrl = resolveDebugUrl(this.debugUrl);
+
+    // 先验明端点身份：不是真浏览器就拒绝（防冒充）
+    await this.assertRealBrowser();
+
     const list = await this.callHttp('/json/list', 'GET');
     if (!Array.isArray(list)) throw new Error('CDP 返回异常');
     const tabs = list.filter(function (t) { return t.type === 'page'; });
@@ -375,4 +512,12 @@ function connectOverCDP(url, opts) {
   return cdp.connect().then(function () { return cdp.browser; });
 }
 
-module.exports = { chromium: { connectOverCDP: connectOverCDP }, Cdp: Cdp, Page: Page };
+module.exports = {
+  chromium: { connectOverCDP: connectOverCDP },
+  Cdp: Cdp,
+  Page: Page,
+  // 端口相关：engine.js 若要显式取地址可调用 getCdpUrl()（可选，不强制）
+  getCdpUrl: getCdpUrl,
+  readCdpPort: readCdpPort,
+  DEFAULT_CDP_PORT: DEFAULT_CDP_PORT,
+};

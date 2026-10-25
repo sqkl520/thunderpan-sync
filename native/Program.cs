@@ -23,12 +23,20 @@ namespace ThunderPanSync
             bool autostart = false;
             foreach (var a in args) { if (a == "--autostart") autostart = true; }
 
-            // 单实例：两个实例会抢 9222 调试端口
+            // 单实例：两个实例会抢调试端口（默认 9222，被占用时回退 9223-9233）
             bool createdNew;
             var mutex = new Mutex(true, "Global\\ThunderPanSync_SingleInstance", out createdNew);
             if (!createdNew)
             {
-                MessageBox.Show("ThunderPanSync 已经在运行（请查看系统托盘）。", "ThunderPanSync",
+                // 只弹 "已经在运行" 会让人以为程序卡住了：本程序退出按钮是
+                // "最小化到托盘"（--autostart 开机启动更是不显示窗口），
+                // 用户看不到窗口时最需要的提示是"去哪找它"，而不是"它存在"。
+                MessageBox.Show(
+                    "ThunderPanSync 已在运行（可能已最小化在系统托盘，请看屏幕右下角的托盘图标）。\r\n\r\n"
+                    + "请双击托盘图标打开主窗口；如果托盘里也没有，请按 Ctrl+Shift+Esc 打开任务管理器，"
+                    + "结束 ThunderPanSync.exe 后重新启动。\r\n\r\n"
+                    + "同一个程序只允许运行一个实例，否则两个实例会抢同一个浏览器调试端口。",
+                    "ThunderPanSync 已在运行",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }

@@ -86,13 +86,20 @@ if (-not $SkipInstaller) {
   Step 3 'Build NSIS installer'
   if (-not (Test-Path $MakeNsis)) { throw "makensis not found: $MakeNsis" }
 
-  $nsi = Join-Path $Root 'installer.nsi'
-  $bytes = [IO.File]::ReadAllBytes($nsi)
-  $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
-  if (-not $hasBom) {
-    Write-Host '  adding UTF-8 BOM to installer.nsi' -ForegroundColor Yellow
-    $text = [IO.File]::ReadAllText($nsi, (New-Object Text.UTF8Encoding $false))
-    [IO.File]::WriteAllText($nsi, $text, (New-Object Text.UTF8Encoding $true))
+  # makensis refuses BOM-less non-ASCII files with "Bad text encoding".
+  # Two files need this: installer.nsi itself, and EULA.txt, which is pulled in
+  # by "!insertmacro MUI_PAGE_LICENSE" and also shipped via "File EULA.txt".
+  # Editors silently drop the BOM, so both are checked (and fixed) every build.
+  foreach ($textFile in @('installer.nsi', 'EULA.txt')) {
+    $p = Join-Path $Root $textFile
+    if (-not (Test-Path $p)) { throw "missing text file: $p" }
+    $bytes = [IO.File]::ReadAllBytes($p)
+    $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+    if (-not $hasBom) {
+      Write-Host ('  adding UTF-8 BOM to ' + $textFile) -ForegroundColor Yellow
+      $text = [IO.File]::ReadAllText($p, (New-Object Text.UTF8Encoding $false))
+      [IO.File]::WriteAllText($p, $text, (New-Object Text.UTF8Encoding $true))
+    }
   }
 
   New-Item -ItemType Directory (Join-Path $Root 'release') -Force | Out-Null

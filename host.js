@@ -36,7 +36,12 @@ const { SyncEngine } = require('./engine/engine');
 function loadConfig() {
   try {
     if (fs.existsSync(P.CONFIG_FILE)) return JSON.parse(fs.readFileSync(P.CONFIG_FILE, 'utf8'));
-  } catch (e) {}
+  } catch (e) {
+    // 配置读坏了不能静默用默认值：用户会以为监视列表还在，实际一个文件都不备份
+    try {
+      process.stderr.write('[host] 读取配置失败，使用默认值（旧配置未覆盖）: ' + e.message + '\n');
+    } catch (e2) {}
+  }
   return {
     watchDirs: [],
     remoteFolderName: 'ThunderPanSync',
@@ -44,12 +49,20 @@ function loadConfig() {
     settleMs: 5000,
     maxSizeMB: 2048,
     autoStartBrowser: true,
+    // 云端版本策略：keep = 绝不动云端旧文件（默认）；replace = 用户显式开启才删旧副本
+    versionsMode: 'keep',
+    maxDeletePerRun: 20,
   };
 }
 
 function saveConfig(cfg) {
-  fs.mkdirSync(P.DATA_DIR, { recursive: true });
-  fs.writeFileSync(P.CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf8');
+  try {
+    fs.mkdirSync(P.DATA_DIR, { recursive: true });
+    fs.writeFileSync(P.CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf8');
+  } catch (e) {
+    // 保存失败必须让界面看到，否则用户以为设置生效了
+    throw new Error('保存配置失败: ' + e.message + '（路径 ' + P.CONFIG_FILE + '）');
+  }
 }
 
 // ---------- 输出（必须无 BOM、UTF-8、单行）----------
@@ -74,11 +87,17 @@ function getEngine() {
       intervalMs: cfg.intervalMs,
       settleMs: cfg.settleMs,
       maxSizeMB: cfg.maxSizeMB,
+      versionsMode: cfg.versionsMode,
+      maxDeletePerRun: cfg.maxDeletePerRun,
       stateFile: P.STATE_FILE,
       logFile: P.LOG_FILE,
     });
     engine.on('log', function (e) { write({ event: 'log', data: e }); });
     engine.on('run-complete', function (s) { write({ event: 'run-complete', data: s }); });
+    // 进度事件：界面进度条的唯一数据来源。
+    // 字段名（phase/index/total/name/size/bytesDone/bytesTotal/elapsedMs/etaMs）由 engine 定义，
+    // host 只做转发，不加工、不改名 —— 改名等于破坏界面契约。
+    engine.on('progress', function (p) { write({ event: 'progress', data: p }); });
   }
   return engine;
 }
@@ -92,7 +111,9 @@ const handlers = {
       status: e.getStatus(),
       dataDir: P.DATA_DIR,
       configFile: P.CONFIG_FILE,
-      logFile: P.LOG_FILE,
+      // 按天分文件：给界面"打开日志"用当天的路径，不要用启动时的旧路径（跨天会开错文件）
+      logFile: P.getLogFile ? P.getLogFile() : P.LOG_FILE,
+      latestLogPointer: P.getLatestLogFile ? P.getLatestLogFile() : null,
       pid: process.pid,
     };
   },
@@ -106,12 +127,15 @@ const handlers = {
           name: path.basename(i.full),
           size: i.st.size,
           skip: i.skip,
+          skipCode: i.skipCode || null,
         };
       }),
     };
   },
   runOnce: async function () {
-    const stats = await getEngine().runOnce();
+    // 手动触发：解除熔断、不受退避限制。这正是"立即同步"按钮的语义 ——
+    // 熔断只停止自动重试，不能连用户手动操作也一并禁止。
+    const stats = await getEngine().runNow();
     return stats;
   },
   start: function () {
@@ -134,6 +158,11 @@ const handlers = {
   saveConfig: function (p) {
     const cur = loadConfig();
     const next = Object.assign({}, cur, p || {});
+    // 版本模式的取值收敛在 host 这一层：拼错的值绝不能变成"可以删云端文件"。
+    // 引擎侧还有第二道防线（constructor 只认 'replace'），两道都要有。
+    if (next.versionsMode !== 'replace') next.versionsMode = 'keep';
+    const mdp = parseInt(next.maxDeletePerRun, 10);
+    next.maxDeletePerRun = (!isNaN(mdp) && mdp >= 0 && mdp <= 200) ? mdp : 20;
     saveConfig(next);
     // 引擎已实例化则同步配置
     if (engine) {
@@ -142,12 +171,21 @@ const handlers = {
       if (next.intervalMs) engine.cfg.intervalMs = next.intervalMs;
       if (next.settleMs !== undefined) engine.cfg.settleMs = next.settleMs;
       if (next.maxSizeMB) engine.cfg.maxSizeMB = next.maxSizeMB;
+      engine.cfg.versionsMode = next.versionsMode;
+      engine.cfg.maxDeletePerRun = next.maxDeletePerRun;
     }
     return { config: next };
   },
   connect: async function () {
     const page = await getEngine().connect();
     return { url: page.url(), title: await page.title() };
+  },
+  // 熔断后"立即同步"的显式入口（与 runOnce 同义，语义更明确，供 C# 端识别）
+  resume: async function () {
+    const e = getEngine();
+    const wasOpen = e.circuitOpen;
+    const stats = await e.runNow();
+    return { resumed: wasOpen, stats: stats, status: e.getStatus() };
   },
   quit: function () {
     if (engine) { try { engine.stop(); } catch (e) {} }
@@ -163,18 +201,58 @@ rl.on('line', function (line) {
   try {
     req = JSON.parse(line);
   } catch (e) {
-    write({ event: 'protocol-error', data: { raw: line.slice(0, 200) } });
+    // 协议错误必须带足够信息让 C# 端显示：原始行（截断）+ 解析原因 + 时间。
+    // 原来只给 raw，界面无法解释"为什么没反应"。
+    write({
+      event: 'protocol-error',
+      data: {
+        raw: line.slice(0, 200),
+        reason: e && e.message ? e.message : String(e),
+        length: line.length,
+        time: new Date().toISOString(),
+      },
+    });
     return;
   }
+  // 解析成功不代表是对象：JSON.parse('null'|'42'|'"s"'|'[]') 都是合法 JSON。
+  // 原来直接读 req.id，遇到 null 会抛 TypeError 让进程 exit=1，
+  // 而 C# 那边只能看到"引擎进程已退出"，完全不知道原因（实测复现过）。
+  if (req === null || typeof req !== 'object' || Array.isArray(req)) {
+    write({
+      event: 'protocol-error',
+      data: {
+        raw: line.slice(0, 200),
+        reason: '解析结果不是对象（got ' + (req === null ? 'null' : typeof req) + '）',
+        length: line.length,
+        time: new Date().toISOString(),
+      },
+    });
+    return;
+  }
+
   const id = req.id;
   const cmd = req.cmd;
-  const fn = handlers[cmd];
-  if (!fn) { reply(id, false, null, 'unknown cmd: ' + cmd); return; }
+
+  // 只认 handlers 自己的属性。用 handlers[cmd] 会让 cmd="constructor" / "toString"
+  // 这类原型链上的名字命中，返回 ok:true（实测过），属于不该有的"成功"。
+  const fn = Object.prototype.hasOwnProperty.call(handlers, cmd) ? handlers[cmd] : null;
+  if (typeof fn !== 'function') {
+    // id 可能是 undefined（对方发了 {}）：原样回一个带 id:null 的响应，
+    // 否则 C# 按 id 匹配会干等到超时，界面表现为"点了没反应"。
+    reply(id === undefined ? null : id, false, null, 'unknown cmd: ' + String(cmd));
+    return;
+  }
 
   Promise.resolve()
     .then(function () { return fn(req.params); })
     .then(function (data) { reply(id, true, data); })
-    .catch(function (e) { reply(id, false, null, e && e.message ? e.message : e); });
+    .catch(function (e) {
+      // 错误也要带 code，界面才能分类显示（QUOTA 要提示"空间不足"，AUTH 要提示"重新登录"）
+      var code = (e && e.code && /^(AUTH|QUOTA|NETWORK|BROWSER|PAGE|DISK|UNKNOWN)$/.test(e.code)) ? e.code : 'UNKNOWN';
+      var msg = e && e.message ? e.message : String(e);
+      write({ event: 'log', data: { level: 'error', msg: msg, code: code, time: new Date().toISOString() } });
+      reply(id, false, null, msg);
+    });
 });
 
 rl.on('close', function () {

@@ -26,9 +26,18 @@ namespace ThunderPanSync
         private readonly Dictionary<int, string> _results = new Dictionary<int, string>();
         private volatile bool _ready = false;
 
+        // stderr 落盘：debug 级别的引擎原始日志不进 UI（会刷屏），但绝不能丢——
+        // 崩溃时的最后几行几乎总是唯一线索。OnFatal 时把末尾若干行附在错误里。
+        private readonly object _stderrSync = new object();
+        private string _stderrFile;
+        private StreamWriter _stderrWriter;
+        private const long StderrFileMaxBytes = 4L * 1024 * 1024;
+
         // UI 回调（在后台线程触发，订阅者需自行 Invoke 到 UI 线程）
         public event Action<string, string, string> OnLog;        // level, msg, time
         public event Action<Dictionary<string, object>> OnRunComplete;
+        public event Action<Dictionary<string, object>> OnProgress;  // 进度事件（字段见 plan WP1）
+        public event Action<string> OnProtocolError;              // host.js 收到无法解析的行
         public event Action<string> OnFatal;                      // stderr 或进程退出
 
         public bool IsReady { get { return _ready; } }
@@ -36,6 +45,9 @@ namespace ThunderPanSync
         /// <summary>启动 node 宿主。nodeExe 与 hostScript 由调用方给出（安装目录定位）。</summary>
         public void Start(string nodeExe, string hostScript, string dataDir)
         {
+            _stderrFile = Path.Combine(dataDir, "engine-stderr.log");
+            PrepareStderrFile();
+
             var psi = new ProcessStartInfo();
             psi.FileName = nodeExe;
             psi.Arguments = "\"" + hostScript + "\"";
@@ -87,12 +99,137 @@ namespace ThunderPanSync
                 string line;
                 while ((line = _proc.StandardError.ReadLine()) != null)
                 {
+                    // 原始行先落盘，再转发给 UI。UI 侧会过滤掉 debug，
+                    // 所以"UI 看不到"与"查不到"必须是两件事。
+                    WriteStderrLine(line);
                     // stderr 是引擎的原始日志，转发给 UI 但不参与协议
                     var h = OnLog;
                     if (h != null) h("debug", line, DateTime.Now.ToString("o"));
                 }
             }
             catch { }
+        }
+
+        // ---------------- stderr 落盘（错误分类用） ----------------
+
+        // 每次启动轮转：上一次会话的 engine-stderr.log 改名为 .prev，
+        // 这样"这次为什么崩"与"上次为什么崩"都能查，又不至于无限增长。
+        private void PrepareStderrFile()
+        {
+            try
+            {
+                if (_stderrFile == null) return;
+                lock (_stderrSync)
+                {
+                    if (_stderrWriter != null) { try { _stderrWriter.Flush(); _stderrWriter.Close(); } catch { } _stderrWriter = null; }
+                    try
+                    {
+                        if (File.Exists(_stderrFile))
+                        {
+                            var prev = _stderrFile + ".prev";
+                            try { if (File.Exists(prev)) File.Delete(prev); } catch { }
+                            File.Move(_stderrFile, prev);
+                        }
+                    }
+                    catch { }
+                    var dir = Path.GetDirectoryName(_stderrFile);
+                    if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                    _stderrWriter = new StreamWriter(new FileStream(_stderrFile, FileMode.Append, FileAccess.Write, FileShare.ReadWrite), new UTF8Encoding(false));
+                    _stderrWriter.AutoFlush = true;
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>把一行 stderr 追加进 engine-stderr.log（超过上限则截断重开）。</summary>
+        private void WriteStderrLine(string line)
+        {
+            if (line == null) return;
+            try
+            {
+                lock (_stderrSync)
+                {
+                    if (_stderrWriter == null) return;
+                    _stderrWriter.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff") + " " + line);
+                    if (_stderrWriter.BaseStream.Length > StderrFileMaxBytes)
+                    {
+                        // 太大就重开（不保留旧的：最新的一定是排障最需要的）
+                        try { _stderrWriter.Flush(); _stderrWriter.Close(); } catch { }
+                        _stderrWriter = null;
+                        try
+                        {
+                            File.Delete(_stderrFile);
+                            _stderrWriter = new StreamWriter(new FileStream(_stderrFile, FileMode.Append, FileAccess.Write, FileShare.ReadWrite), new UTF8Encoding(false));
+                            _stderrWriter.AutoFlush = true;
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>读 engine-stderr.log 的最后 n 行（文件不存在或读失败返回空数组）。</summary>
+        public string[] ReadStderrTail(int n)
+        {
+            var list = new List<string>();
+            if (n <= 0) return list.ToArray();
+            try
+            {
+                lock (_stderrSync)
+                {
+                    if (_stderrWriter != null) { try { _stderrWriter.Flush(); } catch { } }
+                    if (_stderrFile == null || !File.Exists(_stderrFile)) return list.ToArray();
+                    // 共享读：引擎还在写的时候也要能读
+                    using (var fs = new FileStream(_stderrFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    using (var sr = new StreamReader(fs, Encoding.UTF8))
+                    {
+                        string l;
+                        while ((l = sr.ReadLine()) != null)
+                        {
+                            list.Add(l);
+                            if (list.Count > n * 4) list.RemoveRange(0, list.Count - n * 2);
+                        }
+                    }
+                }
+            }
+            catch { }
+            if (list.Count > n) list.RemoveRange(0, list.Count - n);
+            return list.ToArray();
+        }
+
+        private void CloseStderrFile()
+        {
+            try
+            {
+                lock (_stderrSync)
+                {
+                    if (_stderrWriter != null) { try { _stderrWriter.Flush(); _stderrWriter.Close(); } catch { } _stderrWriter = null; }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 生成带 stderr 尾部的错误详情：最近 100 行原始 stderr 附在消息后面。
+        /// 只报"引擎进程已退出"对排障毫无价值，必须带上它退出前说的话。
+        /// </summary>
+        public string BuildFatalDetail(string msg, int tailLines)
+        {
+            var tail = ReadStderrTail(tailLines <= 0 ? 100 : tailLines);
+            if (tail.Length == 0) return msg;
+            var sb = new StringBuilder();
+            sb.Append(msg);
+            sb.Append(Environment.NewLine);
+            sb.Append("---- engine-stderr.log 最后 " + tail.Length + " 行 ----");
+            sb.Append(Environment.NewLine);
+            sb.Append("文件: " + (_stderrFile == null ? "(未知)" : _stderrFile));
+            for (int i = 0; i < tail.Length; i++)
+            {
+                sb.Append(Environment.NewLine);
+                sb.Append(tail[i]);
+            }
+            return sb.ToString();
         }
 
         private void Dispatch(string line)
@@ -121,6 +258,28 @@ namespace ThunderPanSync
                 {
                     var h = OnRunComplete;
                     if (h != null) h(data);
+                    return;
+                }
+                // 进度：高频事件，只抛给 UI 更新控件，不写日志（否则日志区被刷屏）
+                if (ev == "progress" && data != null)
+                {
+                    var h = OnProgress;
+                    if (h != null) h(data);
+                    return;
+                }
+                // host.js 收到无法解析的行时上报；之前 C# 端没有任何分支，
+                // 于是协议损坏是完全静默的——界面看起来"一切正常但不动"。
+                if (ev == "protocol-error")
+                {
+                    string raw = data != null ? Str(data, "raw") : "";
+                    if (raw.Length == 0) raw = Trunc(line, 200);
+                    // host.js 还会给 reason（为什么坏）：带上它，否则用户只看到
+                    // "有一行说不清"，却不知道是 JSON 语法错还是结构不是对象。
+                    string reason = data != null ? Str(data, "reason") : "";
+                    string msg = raw;
+                    if (reason.Length > 0) msg = raw + "  (原因: " + reason + ")";
+                    var h = OnProtocolError;
+                    if (h != null) h(msg);
                     return;
                 }
                 return;
@@ -235,6 +394,7 @@ namespace ThunderPanSync
                 }
             }
             catch { }
+            CloseStderrFile();
         }
     }
 }

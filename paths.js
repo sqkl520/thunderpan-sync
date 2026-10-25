@@ -48,6 +48,41 @@ function profileDir() {
   return p;
 }
 
+// ---------- 日志按天分文件 ----------
+// 为什么不再只写一个 sync.log：
+//   常驻同步跑几个月后单文件会到几十 MB，用户/支持要定位"昨天那次失败"时
+//   既打不开也搜不动。按天切分后，只要按日期找文件即可。
+// Windows 不能建软链，所以另写一个 latest.log 指针文件，内容是"当前活动日志"的完整路径。
+function pad2(n) { return n < 10 ? '0' + n : '' + n; }
+
+// YYYY-MM-DD（本地时区：日志是给人看的，必须与用户看到的日期一致，不能用 UTC）
+function dayStamp(d) {
+  const t = d instanceof Date ? d : (d ? new Date(d) : new Date());
+  if (isNaN(t.getTime())) return dayStamp(new Date());
+  return t.getFullYear() + '-' + pad2(t.getMonth() + 1) + '-' + pad2(t.getDate());
+}
+
+// 当天的日志文件；传 Date/日期字符串可取任意一天
+function getLogFile(d) {
+  return path.join(DATA_DIR, 'sync-' + dayStamp(d) + '.log');
+}
+
+// 指针文件：内容为当前活动日志路径（每次跨天覆盖一次，不重复写）
+function getLatestLogFile() {
+  return path.join(DATA_DIR, 'latest.log');
+}
+
+function noteLatestLog(file) {
+  const target = getLatestLogFile();
+  const body = file + '\n';
+  try {
+    // 已经是同一路径就不重写，避免每条日志都产生一次磁盘写
+    try { if (fs.readFileSync(target, 'utf8') === body) return; } catch (e) {}
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, body, 'utf8');
+  } catch (e) { /* 指针文件写失败不影响日志本身 */ }
+}
+
 module.exports = {
   isPackaged() {
     try {
@@ -59,6 +94,14 @@ module.exports = {
   PROFILE_DIR: profileDir,
   CONFIG_FILE: path.join(DATA_DIR, 'config.json'),
   STATE_FILE: path.join(DATA_DIR, 'state.json'),
-  LOG_FILE: path.join(DATA_DIR, 'sync.log'),
+  // 保留 LOG_FILE 是为了向后兼容（host.js 的 status 回复、engine 的 cfg.logFile）。
+  // 注意它只是"模块加载那一天"的路径；跨天要用 getLogFile() 重新取。
+  LOG_FILE: getLogFile(),
+  // 按天分文件：sync-YYYY-MM-DD.log
+  getLogFile: getLogFile,
+  getLatestLogFile: getLatestLogFile,
+  // latest.log 指针（内容为当前活动日志的完整路径；Windows 不能建软链）
+  noteLatestLog: noteLatestLog,
   PROBE_FILE: path.join(DATA_DIR, '.probe.txt'),
 };
+
