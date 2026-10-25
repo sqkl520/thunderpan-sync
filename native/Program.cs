@@ -51,6 +51,16 @@ namespace ThunderPanSync
             Directory.CreateDirectory(dataDir);
 
             var form = new MainForm(dataDir);
+
+            // 用户拒绝 EULA 时构造函数会提前 return，此时窗体控件一个都没建。
+            // 直接 Application.Run(form) 行为不确定（可能立刻退出，也可能弹异常框），
+            // 必须显式判断后干净退出。
+            if (form.EulaDeclined)
+            {
+                try { form.Dispose(); } catch { }
+                return;
+            }
+
             Application.Run(form);
 
             GC.KeepAlive(mutex);

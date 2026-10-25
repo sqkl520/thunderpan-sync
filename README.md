@@ -2,7 +2,7 @@
 
 把本地文件夹自动备份到**迅雷云盘**的 Windows 桌面应用。
 
-原生 WinForms 界面（不是浏览器套壳），可执行文件 35 KB。
+原生 WinForms 界面（不是浏览器套壳），可执行文件约 50 KB。
 
 > **先读这一节，再决定要不要用。** 这个工具的能力边界写得很清楚，请按它的实际能力使用。
 
@@ -127,13 +127,22 @@
 
 ## 从源码构建
 
-需要：.NET Framework 4.8（Win10/11 自带）、Node.js 18+（构建时用，会被打进安装包）。
+需要：
+
+- **.NET Framework 4.8**（Win10/11 自带，提供 `csc.exe`）
+- **Node.js 18+**（构建时用来确定运行时来源，会被打进安装包）
+- **NSIS 3.x（makensis）** —— 只有生成安装包时才需要。脚本按下面顺序找：
+  1. `%LOCALAPPDATA%\electron-builder\Cache\nsis-3.0.4.1\nsis-3.0.4.1-1mpw4\makensis.exe`
+  2. `PATH` 里的 `makensis`
+
+  如果两者都没有，`-SkipInstaller` 仍然可用（只产出 exe 与发布目录）；不加该开关会以
+  `makensis not found` 失败。
 
 ```powershell
 # 一键构建（编译 C# → 组装发布目录 → 生成 NSIS 安装包）
 .\build-native.ps1
 
-# 只构建目录，不生成安装包
+# 只构建目录，不生成安装包（不需要 NSIS）
 .\build-native.ps1 -SkipInstaller
 
 # 构建完直接启动
@@ -142,12 +151,16 @@
 
 产物在 `release\ThunderPanSync-Setup-1.0.0.exe`。
 
+`installer.nsi` 与 `EULA.txt` 必须是 **UTF-8 带 BOM**，否则 `makensis` 报 `Bad text encoding`。
+多数编辑器保存时会丢掉 BOM，所以 `build-native.ps1` 每次构建前自动补 ——
+但如果你手工直接跑 `makensis`，要自己确保 BOM 在。
+
 构建脚本是纯 ASCII 的——Windows PowerShell 5.1 会按系统 ANSI 代码页读取无 BOM 的 `.ps1`，注释里的中文会破坏后续 token 解析（这个坑踩过）。
 
 ## 架构
 
 ```
-ThunderPanSync.exe          35 KB   C# WinForms 界面（原生控件）
+ThunderPanSync.exe          50 KB   C# WinForms 界面（原生控件）
   ├─ EngineHost.cs                  stdio JSON-RPC 客户端，管理 Node 子进程
   ├─ BrowserManager.cs              启动/隐藏/清理后台 Edge，选调试端口
   └─ MainForm.cs                    界面 + 托盘 + 开机自启 + 进度 + EULA
@@ -160,7 +173,7 @@ engine\engine\cdp.js                自研 CDP 客户端（替代 playwright，�
 
 界面与引擎通过 **stdio JSON-RPC** 通信——不占端口、不触发防火墙、随主进程退出。
 
-**为什么不用 Electron：** 试过。239 MB，界面是 Chromium 渲染的网页。换成原生 WinForms 后主程序 35 KB，界面是真 Windows 控件。
+**为什么不用 Electron：** 试过。239 MB，界面是 Chromium 渲染的网页。换成原生 WinForms 后主程序约 50 KB，界面是真 Windows 控件。
 
 ## 数据位置
 

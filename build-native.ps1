@@ -23,7 +23,26 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Csc = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-$MakeNsis = "$env:LOCALAPPDATA\electron-builder\Cache\nsis-3.0.4.1\nsis-3.0.4.1-1mpw4\makensis.exe"
+
+# Locate makensis. The electron-builder cache path is the one that exists on the
+# machine this was developed on, but a fresh clone elsewhere will not have it.
+# Try that first, then PATH, then the usual install roots.
+function Find-MakeNsis {
+  $cands = @(
+    "$env:LOCALAPPDATA\electron-builder\Cache\nsis-3.0.4.1\nsis-3.0.4.1-1mpw4\makensis.exe"
+  )
+  $onPath = Get-Command makensis.exe -ErrorAction SilentlyContinue
+  if ($onPath) { $cands += $onPath.Source }
+  $cands += @(
+    "$env:ProgramFiles\NSIS\makensis.exe",
+    "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+  )
+  foreach ($c in $cands) {
+    if ($c -and (Test-Path $c)) { return $c }
+  }
+  return $null
+}
+$MakeNsis = Find-MakeNsis
 
 function Step($n, $msg) { Write-Host ""; Write-Host "[$n] $msg" -ForegroundColor Cyan }
 
@@ -84,7 +103,12 @@ Write-Host ('  OK  {0:N1} MB' -f ($sum / 1MB)) -ForegroundColor Green
 # ---------- 3. build installer ----------
 if (-not $SkipInstaller) {
   Step 3 'Build NSIS installer'
-  if (-not (Test-Path $MakeNsis)) { throw "makensis not found: $MakeNsis" }
+  if (-not $MakeNsis) {
+    throw ("makensis not found. Install NSIS 3.x and either add it to PATH " +
+      "or place it at $env:ProgramFiles\NSIS\makensis.exe. " +
+      "Alternatively run: .\build-native.ps1 -SkipInstaller (builds the exe and publish dir only).")
+  }
+  Write-Host "  makensis: $MakeNsis"
 
   # makensis refuses BOM-less non-ASCII files with "Bad text encoding".
   # Two files need this: installer.nsi itself, and EULA.txt, which is pulled in
