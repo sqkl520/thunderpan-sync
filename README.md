@@ -130,12 +130,15 @@
 需要：
 
 - **.NET Framework 4.8**（Win10/11 自带，提供 `csc.exe`）
-- **Node.js 18+**（构建时用来确定运行时来源，会被打进安装包）
+- **Node.js 18+** —— 构建时用 `(Get-Command node).Source` **把构建机 PATH 里的 `node.exe`
+  复制进安装包**作为运行时。因此不同 Node 版本的构建机产出的安装包不同（本机实测用 v26.12.1）
 - **NSIS 3.x（makensis）** —— 只有生成安装包时才需要。脚本按下面顺序找：
   1. `%LOCALAPPDATA%\electron-builder\Cache\nsis-3.0.4.1\nsis-3.0.4.1-1mpw4\makensis.exe`
   2. `PATH` 里的 `makensis`
+  3. `%ProgramFiles%\NSIS\makensis.exe`
+  4. `%ProgramFiles(x86)%\NSIS\makensis.exe`
 
-  如果两者都没有，`-SkipInstaller` 仍然可用（只产出 exe 与发布目录）；不加该开关会以
+  如果都没有，`-SkipInstaller` 仍然可用（只产出 exe 与发布目录）；不加该开关会以
   `makensis not found` 失败。
 
 ```powershell
@@ -150,6 +153,27 @@
 ```
 
 产物在 `release\ThunderPanSync-Setup-1.0.0.exe`。
+
+### 关于构建产物的可复现性（实测数据，别拿 sha256 当发布校验）
+
+自己重新构建出的安装包**不会**和官方发布的逐字节相同，这有三个已实测的原因：
+
+1. **C# 编译不可复现**。本机 `csc.exe`（4.8.9232，只支持 C# 5）**不认 `/deterministic`**
+   （实测报 `fatal error CS2007`），所以每次编译 PE 头里的 `TimeDateStamp`（偏移 `0x88`）
+   和托管模块的 MVID GUID（偏移 `0xB388`）都不同 —— 同一份源码连编两次，
+   产物等长但差 18 字节。
+2. **安装包会嵌入被打包文件的 mtime**。实测：11 个输入文件内容不变，只把其中一个
+   的 mtime 从 `2026-01-01` 改成 `2026-06-15`，安装包大小从 26,980,864 B 变成
+   26,980,653 B（差 211 B）；改回 mtime 后 sha256 完全恢复。所以文件系统时间戳
+   会改变压缩流。
+3. **安装包内嵌了 C# exe**，上面第 1 条的 18 字节差异会被放大成整包不同。
+
+已验证的**确定性**部分：NSIS 本身是确定性的（同一输入连跑两次 sha256 逐字节一致）；
+`engine/*.js`、`host.js`、`paths.js` 与 `runtime/node.exe` 在不同机器上构建出来
+sha256 完全相同（只要 Node 版本一致）。
+
+想做发布校验，请在 `release\` 旁边生成 `sha256` 清单并**只用于检测下载损坏**，
+不要用它证明「产物等于源码」。
 
 `installer.nsi` 与 `EULA.txt` 必须是 **UTF-8 带 BOM**，否则 `makensis` 报 `Bad text encoding`。
 多数编辑器保存时会丢掉 BOM，所以 `build-native.ps1` 每次构建前自动补 ——
