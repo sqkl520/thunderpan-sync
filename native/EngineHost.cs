@@ -26,6 +26,15 @@ namespace ThunderPanSync
         private readonly Dictionary<int, string> _results = new Dictionary<int, string>();
         private volatile bool _ready = false;
 
+        // 主动关闭标志。
+        //
+        // 为什么必须有：ReadStdout 在 stdout 关闭后会无条件 RaiseFatal("引擎进程已退出")。
+        // 于是【每次正常退出应用】都会触发一次"● 引擎异常"——Shutdown() 发完 quit
+        // 之后 host 正常退出，stdout 关闭，就被当成崩溃。实测在界面上的表现是：
+        // 状态条写着"尚未配置（请添加文件夹）"，下面的进度条却写着
+        // "已停止（引擎异常）"，两条互相矛盾，而且那句告警是假的。
+        private volatile bool _closing = false;
+
         // stderr 落盘：debug 级别的引擎原始日志不进 UI（会刷屏），但绝不能丢——
         // 崩溃时的最后几行几乎总是唯一线索。OnFatal 时把末尾若干行附在错误里。
         private readonly object _stderrSync = new object();
@@ -65,6 +74,9 @@ namespace ThunderPanSync
 
             _proc = new Process();
             _proc.StartInfo = psi;
+            // 重新启动时清掉关闭标志，否则新进程真的崩了也不会报异常。
+            _closing = false;
+            _ready = false;
             _proc.Start();
 
             var tOut = new Thread(ReadStdout);
@@ -89,7 +101,9 @@ namespace ThunderPanSync
                 }
             }
             catch (Exception ex) { RaiseFatal("stdout 读失败: " + ex.Message); }
-            RaiseFatal("引擎进程已退出");
+            // 主动 Shutdown 导致的退出不是异常。不判断 _closing 的话，
+            // 每次正常关闭应用都会在界面上留一条假的"引擎异常"告警。
+            if (!_closing) RaiseFatal("引擎进程已退出");
         }
 
         private void ReadStderr()
@@ -377,6 +391,9 @@ namespace ThunderPanSync
 
         public void Shutdown()
         {
+            // 必须先置位再发 quit：读线程可能在 quit 之后立刻看到 EOF，
+            // 晚一步就会先抛出"引擎进程已退出"再被这里覆盖，信号已经发给 UI 了。
+            _closing = true;
             try
             {
                 if (_proc != null && !_proc.HasExited)

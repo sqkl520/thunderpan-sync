@@ -605,10 +605,45 @@ namespace ThunderPanSync
 
                 _host.Start(node, host, _dataDir);
 
-                // 等 ready（最多 10 秒）
-                for (int i = 0; i < 100 && !_host.IsReady; i++) Thread.Sleep(100);
+                // 等 ready。
+                //
+                // 为什么不是"固定等 10 秒然后判死"：
+                // 实测踩到过 —— 在 LZMA 压 105 MB node.exe 的同时启动应用，
+                // host.js 没能在 10 秒内吐出 ready，界面就被判成"● 引擎异常 /
+                // 已停止（引擎异常）"，而且【永久停在这个假告警上】；实际上引擎
+                // 几秒后就正常就绪了。用户的机器会同时跑杀毒扫描、Windows 更新、
+                // 压缩包，这不是罕见场景。
+                //
+                // 新策略：前 15 秒只"等"，不报警；之后如果仍然没 ready，
+                // 就明确显示"启动较慢"（黄色，不是红色异常），继续等；
+                // 只有连进程都死了，才是真异常（那条路径由 OnFatal 负责）。
+                // 真异常的信息比"超时"精确得多，没必要用超时去猜。
+                bool slowNotified = false;
+                for (int i = 0; i < 1200 && !_host.IsReady; i++)
+                {
+                    Thread.Sleep(100);
+                    if (i == 150 && !_host.IsReady)
+                    {
+                        slowNotified = true;
+                        UiInvoke(delegate
+                        {
+                            _lblState.Text = "● 引擎启动较慢，仍在等…";
+                            _lblState.ForeColor = Color.Gold;
+                            SetProgressIdle("引擎启动较慢（机器繁忙时正常），请稍候…");
+                        });
+                    }
+                }
 
-                if (!_host.IsReady) { UiFatal("引擎启动超时"); return; }
+                if (!_host.IsReady)
+                {
+                    // 走到这里说明等了 120 秒：进程还在但一直不就绪，按异常处理。
+                    UiFatal("引擎启动超时（120 秒无响应）");
+                    return;
+                }
+                if (slowNotified)
+                {
+                    AppendLog("引擎启动较慢，现已就绪（机器繁忙时属正常现象）");
+                }
 
                 // 不显示"● 就绪"——那会让人以为在备份。
                 // 真实状态由 RefreshStatus 根据 running 判定（未在备份时是红色）。

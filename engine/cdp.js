@@ -142,6 +142,32 @@ class Page {
   isClosed() { return this._closed; }
   url() { return this._url; }
 
+  // 页面是否还能响应 CDP。
+  //
+  // 为什么必须有这个方法（实测踩到的真问题）：
+  //   浏览器连续跑了几小时后，pan.xunlei.com 那个标签的渲染进程会僵死。
+  //   此时 Target.getTargets / Target.createTarget 这些 Browser 级命令仍然正常，
+  //   WebSocket 也能连上（/json 里照样列出这个页面），但 Page.enable 永远不回。
+  //   原来的 connect() 只挑第一个 url 含 pan.xunlei.com 的页面就直接用，
+  //   于是表现为：connect() 成功 → 之后每次 _capHeader 都"头截取超时"，
+  //   整轮同步永远失败，而界面只会说"登录/凭证问题"，误导用户去重新登录。
+  //
+  // 判据用 Page.enable：它必须在 5 秒内回。真浏览器一定会回；
+  // 僵死的渲染进程不会。不能只靠 isClosed()（那个只反映 CDP 会话状态）。
+  async isResponsive(timeoutMs) {
+    if (this._closed) return false;
+    const t = timeoutMs || 5000;
+    try {
+      await Promise.race([
+        this.cdp.send(this.wsUrl, 'Page.enable', {}),
+        sleep(t).then(function () { throw new Error('probe timeout'); }),
+      ]);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   async title() {
     try {
       const r = await this.cdp.send(this.wsUrl, 'Runtime.evaluate', {

@@ -225,6 +225,13 @@ class SyncEngine extends EventEmitter {
 
   // ================= 浏览器 =================
   async connect() {
+    // 缓存页面直接返回，不在这里探活。
+    //
+    // 为什么不做"每次 connect 都探活"：connect() 在每轮同步里会被调用几十次
+    // （每次截 captcha、每次核查都会走），探活一次要 5 秒，等于把每次同步
+    // 拖慢几百秒。页面僵死由两条更精准的路径发现：
+    //   1. _capHeader 超时 → 调 _dropPage() 作废缓存页面
+    //   2. 本函数走"重新连接"分支时对候选页面做一次 isResponsive 探测
     if (this.page && !this.page.isClosed()) return this.page;
     try {
       this.browser = await chromium.connectOverCDP(CDP, { timeout: 8000 });
@@ -235,6 +242,24 @@ class SyncEngine extends EventEmitter {
     const ctx = this.browser.contexts()[0];
     if (!ctx) throw this._err('浏览器没有 context', 'BROWSER');
     let page = ctx.pages().find(p => p.url().includes('pan.xunlei.com'));
+
+    // 页面存在 ≠ 页面可用。
+    //
+    // 实测：浏览器连续跑几小时后 pan.xunlei.com 的渲染进程会僵死 ——
+    // WebSocket 能连上、/json 里照样列着这个页面，但 Page.enable 永不返回。
+    // 原实现直接拿来用，于是 connect() 成功、之后每次截 captcha 都超时，
+    // 整轮同步永远失败，界面却提示"请重新登录"（错的方向）。
+    //
+    // 所以这里必须探活。探不通就换一个新标签页，而不是抱着死页面继续跑。
+    if (page && typeof page.isResponsive === 'function') {
+      const alive = await page.isResponsive(5000);
+      if (!alive) {
+        this.log('warn', '已打开的迅雷云盘页面无响应（浏览器长期运行常见），换一个新标签页', 'BROWSER');
+        try { page.close(); } catch (e) { /* 关不掉也无所谓，我们不用它了 */ }
+        page = null;
+      }
+    }
+
     if (!page) {
       page = await ctx.newPage();
       await page.goto(PAN, { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -245,6 +270,21 @@ class SyncEngine extends EventEmitter {
     }
     this.page = page;
     return page;
+  }
+
+  // 作废当前缓存的页面，下次 connect() 会重新选/新建。
+  //
+  // 用在"页面疑似僵死"的场合（截 captcha 超时）。不这么做的话，
+  // 死页面会被一直缓存着，之后每一次操作都超时，用户看到的是
+  // "永远在失败"，而实际上换个标签页就能正常工作。
+  _dropPage(reason) {
+    if (this.page) {
+      try { this.page.close(); } catch (e) { }
+      this.page = null;
+      // header 是从那个页面截的，页面换了必须重新截
+      this._hdrCache = {};
+      this.log('warn', `已丢弃无响应的浏览器页面（${reason || '未知原因'}），下次会新建`, 'BROWSER');
+    }
   }
 
   // 截取真实请求头 —— captcha 只能这样拿到
@@ -297,6 +337,9 @@ class SyncEngine extends EventEmitter {
         if (!done) {
           done = true;
           page.off('request', handler);
+          // 超时最可能的原因就是这个页面已经僵死（实测：浏览器跑久了渲染进程僵死，
+          // Page.enable 都不回）。作废它，否则后面每一次都会以同样方式超时。
+          this._dropPage('截取 ' + method + ' 头超时');
           reject(this._err(`${method} 头截取超时`, 'AUTH'));
         }
       }, timeoutMs);
@@ -767,7 +810,19 @@ class SyncEngine extends EventEmitter {
   // 带缓存的 GET：遇到鉴权/captcha 失效时自动作废缓存并重试一次
   async _apiGet(url) {
     for (let attempt = 0; attempt < 2; attempt++) {
-      const gh = await this._capHeader('GET', 25000);
+      let gh;
+      try {
+        gh = await this._capHeader('GET', 25000);
+      } catch (e) {
+        // 截头失败（最可能是页面僵死，_capHeader 已顺手 _dropPage 了）。
+        // 第一次失败就重试：此时 connect() 会新建一个页面，通常立刻就正常。
+        // 原实现让异常直接冒泡，一次页面僵死就让整轮同步全军覆没。
+        if (attempt === 0) {
+          this.log('info', '截取请求头失败，换页面重试一次', 'AUTH');
+          continue;
+        }
+        throw e;
+      }
       const r = await fetch(url, { headers: this._H(gh) });
       if (r.status === 200) return r;
       // captcha 或 token 失效：清缓存后重试一次
