@@ -29,6 +29,9 @@ namespace ThunderPanSync
             Text = "ThunderPanSync · 视觉层自检";
             ClientSize = new Size(920, 700);
             AutoScaleMode = AutoScaleMode.None;
+            // DarkForm 只自绘顶部 TitleBarPx 高的标题栏，内容区必须自己让出来
+            // （和 MainForm 一样）。原来漏了这行 ⇒ 顶部 34px 被内容盖住，标题栏/标签条验证不了。
+            Padding = new Padding(0, TitleBarPx, 0, 0);
             MinimumSize = new Size(760, 520);
             StartPosition = FormStartPosition.CenterScreen;
 

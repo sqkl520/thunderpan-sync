@@ -174,25 +174,6 @@ namespace ThunderPanSync
             catch { return new Font(FontFamily.GenericSansSerif, size, style, GraphicsUnit.Point); }
         }
 
-        // ---------------- 字体可用性探测 ----------------
-        internal static bool HasFont(string name)
-        {
-            try
-            {
-                using (var f = new FontFamily(name)) { return true; }
-            }
-            catch { return false; }
-        }
-
-        /// <summary>可用的中文 UI 字体（按优先级挑一个装了的）。</summary>
-        internal static string UiFontFamily()
-        {
-            string[] cands = new string[] {
-                "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", "Tahoma",
-            };
-            foreach (var c in cands) { if (HasFont(c)) return c; }
-            return FontFamily.GenericSansSerif.Name;
-        }
 
         // ---------------- 工具方法 ----------------
         /// <summary>按比例混合两个颜色（t=0 取 a，t=1 取 b）。用于做 hover/active 过渡色。</summary>

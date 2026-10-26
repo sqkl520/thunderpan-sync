@@ -17,6 +17,7 @@ namespace ThunderPanSync
     // ===========================================================
     //  CardPanel -- 圆角卡片容器
     // ===========================================================
+    // 目前仅 UiPreview.cs（开发期自检）使用；产品代码里 0 引用（保留原因同 FlatButton）。
     internal class CardPanel : Panel
     {
         public Color CardBack = Theme.BgSurface;
@@ -48,6 +49,8 @@ namespace ThunderPanSync
     // ===========================================================
     //  FlatButton -- 扁平按钮（圆角 / hover / 按下 / 禁用 / 主次区分）
     // ===========================================================
+    // 目前仅 UiPreview.cs（开发期自检）使用；产品 MainForm 用原生 Button（MakeButton）。
+    // 保留原因：这是唯一能单独看 4 种按钮 Kind 视觉的工具，删了自检窗口编译不过。
     internal class FlatButton : Button
     {
         public enum Kind { Primary, Secondary, Danger, Ghost }
@@ -312,6 +315,7 @@ namespace ThunderPanSync
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
                 | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
             BackColor = Theme.BgBar;
+            ForeColor = Theme.TextPrimary;   // 未显式设置时的兜底（自检窗口直接用这个）
             Font = Theme.FontBody;
             Height = Theme.S(26);
             _blink = new Timer();
@@ -401,7 +405,7 @@ namespace ThunderPanSync
             {
                 case PillKind.Running: return Theme.Ok;
                 case PillKind.NotConfigured: return Theme.Warn;
-                case PillKind.Configured: return Theme.Danger;   // 有目录但没在备份
+                case PillKind.Configured: return Theme.TextTertiary;  // 待命 = 中性色（红色只留给"需要关注"）
                 case PillKind.Paused: return Theme.Warn;
                 case PillKind.Error: return Theme.Danger;
                 default: return Theme.TextTertiary;
@@ -414,7 +418,7 @@ namespace ThunderPanSync
             {
                 case PillKind.Running: return Theme.OkBg;
                 case PillKind.NotConfigured: return Theme.WarnBg;
-                case PillKind.Configured: return Theme.DangerBg;
+                case PillKind.Configured: return Theme.BgSurfaceAlt;
                 case PillKind.Paused: return Theme.WarnBg;
                 case PillKind.Error: return Theme.DangerBg;
                 default: return Theme.BgSurfaceAlt;
@@ -460,15 +464,9 @@ namespace ThunderPanSync
                         g.FillEllipse(b, ix, iy, iconSize, iconSize);
                         break;
                     case PillKind.Configured:
-                        // 实心三角 = 需要关注（形状本身就是警告符号）
-                        {
-                            Point[] tri = new Point[] {
-                                new Point(ix + iconSize / 2, iy),
-                                new Point(ix + iconSize, iy + iconSize),
-                                new Point(ix, iy + iconSize),
-                            };
-                            g.FillPolygon(b, tri);
-                        }
+                        // 空心圆 = 待命（文件夹配好了、登录了、只是没开始备份）。
+                        // 原来画实心三角 + 红色，把完全正常的状态渲染成"出错了"（必修 12）。
+                        g.DrawEllipse(pen, ix, iy, iconSize, iconSize);
                         break;
                     case PillKind.Error:
                         // 叉号 = 出错。这两个状态颜色相同（都是 Theme.Danger，语义上都属危险），
@@ -503,7 +501,9 @@ namespace ThunderPanSync
             }
 
             var textRect = new Rectangle(ix + iconSize + Theme.S(8), 0, Width - (ix + iconSize + Theme.S(8)) - Theme.S(10), h);
-            Draw.TextLeft(g, _text, Font, textRect, Theme.TextPrimary);
+            // 文字色跟随 ForeColor：调用方（MainForm）一直按状态设 ForeColor，但这里写死成
+            // Theme.TextPrimary，于是那次赋值是死代码，颜色永远是"正常文字色"（必修 12）
+            Draw.TextLeft(g, _text, Font, textRect, ForeColor);
         }
     }
 

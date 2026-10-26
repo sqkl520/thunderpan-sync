@@ -81,6 +81,14 @@ namespace ThunderPanSync
         private int _stConsecFail = 0;
         private int _stUploadedTotal = 0;
         private int _stFailedTotal = 0;
+        // 待核实（引擎 unverified 队列长度）：既不是成功也不是失败，只在日志里明说一次，
+        // 不动状态条列宽（那是已验收过的布局）。
+        private int _stUnverifiedTotal = 0;
+        private int _stUnverifiedShown = -1;
+        // P1：日志合批。AppendLog 只入队，50ms 一次的 Timer 一次性 AppendText，
+        // 否则 20,000 条日志 ≈ 30 分钟 UI 线程占满（连「停止」都点不动）。
+        private readonly Queue<string> _logPending = new Queue<string>();
+        private System.Windows.Forms.Timer _logTimer;
         private NotifyIcon _tray;
         private bool _reallyQuit = false;
         private volatile bool _loggedIn = false;
@@ -687,8 +695,16 @@ namespace ThunderPanSync
             _txtLog.BackColor = Theme.BgInset;
             _txtLog.ForeColor = Theme.TextSecondary;
             _txtLog.Font = new Font("Consolas", 9F);
+            // P1（性能，实测）：WordWrap 默认 true 时，多行只读 TextBox 追加一行要重排整段，
+            // 实测 90.6 ms/行；关掉后 1.3 ms/行（65 倍）。日志区不需要自动换行（有横向滚动条）。
+            _txtLog.WordWrap = false;
             _txtLog.BorderStyle = BorderStyle.None;
             logPanel.Controls.Add(_txtLog);
+            // 6a：原生 EDIT 的滚动条不吃深色主题 ⇒ 整窗最亮的白块（实测占全窗白像素 62%）。
+            // 句柄建好之后再套 DarkMode_Explorer（Handle 未建时 SetWindowTheme 无效）。
+            _txtLog.HandleCreated += delegate { Draw.TryDarkScrollbars(_txtLog); };
+            // 6b：Fill 必须 Z 序 0，否则 Top 的「运行日志：」标题会压住日志首行 24px（实测重叠）
+            logPanel.Controls.SetChildIndex(_txtLog, 0);
             // A-9：日志一显示就全文选中会整块变选中蓝（白像素 ×4）
             _txtLog.Select(0, 0);
 
@@ -956,6 +972,7 @@ namespace ThunderPanSync
             if (code == "NETWORK") return "网络连不上云端";
             if (code == "PAGE") return "云盘网页结构可能变了";
             if (code == "DISK") return "读不到本地文件（被占用或没有权限）";
+            if (code == "MISSING_DIR") return "被监视的文件夹找不到了（可能被改名或删除）";
             if (code == "UNKNOWN") return "原因未知（已写入日志）";
             return "原因未知（" + code + "，已写入日志）";
         }
@@ -967,14 +984,6 @@ namespace ThunderPanSync
             return (bytes / (1024.0 * 1024.0 * 1024.0)).ToString("0.00") + " GB";
         }
 
-        private static string FormatEta(long ms)
-        {
-            if (ms < 1000) return "0 秒";
-            long sec = ms / 1000;
-            if (sec < 60) return sec + " 秒";
-            if (sec < 3600) return (sec / 60) + " 分 " + (sec % 60) + " 秒";
-            return (sec / 3600) + " 小时 " + ((sec % 3600) / 60) + " 分";
-        }
 
 
         private void UiInvoke(Action a)
@@ -989,28 +998,56 @@ namespace ThunderPanSync
 
         private void AppendLog(string msg)
         {
-            UiInvoke(delegate
-            {
-                _txtLog.AppendText("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + msg + Environment.NewLine);
-                if (_txtLog.Lines.Length > 800)
-                {
-                    // 裁剪前必须先把被裁掉的部分落盘。
-                    // 原来的实现直接"砍掉最前 300 行"，而启动过程与第一次失败的原因
-                    // 恰好就在最前面——用户和我们事后都查不到根因，这是日志最大的缺陷。
-                    var cur = _txtLog.Lines;
-                    int cut = 300;
-                    if (cut > cur.Length) cut = cur.Length;
-                    var dropped = new string[cut];
-                    Array.Copy(cur, 0, dropped, 0, cut);
-                    AppendUiLogArchive(dropped);
+            // P1：只入队，真正的 AppendText 由 FlushLogQueue 每 50ms 合批做一次。
+            // 逐条 AppendText + SelectionStart + ScrollToCaret 在 20k 行时实测 112.7 ms/行，
+            // WM_NULL 探测最大 5,014 ms 无响应 —— 窗口假死，用户连「停止」都点不动。
+            lock (_logPending) _logPending.Enqueue("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + msg + Environment.NewLine);
+            EnsureLogTimer();
+        }
 
-                    var keep = new string[cur.Length - cut];
-                    Array.Copy(cur, cut, keep, 0, keep.Length);
-                    _txtLog.Lines = keep;
+        private void EnsureLogTimer()
+        {
+            if (_logTimer != null) return;
+            _logTimer = new System.Windows.Forms.Timer();
+            _logTimer.Interval = 50;
+            _logTimer.Tick += delegate { FlushLogQueue(); };
+            _logTimer.Start();
+        }
+
+        // 把队列里的日志一次写进控件（最多 400 行/次，保证单帧不会太久）
+        private void FlushLogQueue()
+        {
+            if (_txtLog == null || _txtLog.IsDisposed) return;
+            var sb = new StringBuilder();
+            int n = 0;
+            lock (_logPending)
+            {
+                while (_logPending.Count > 0 && n < 400)
+                {
+                    sb.Append(_logPending.Dequeue());
+                    n++;
                 }
-                _txtLog.SelectionStart = _txtLog.TextLength;
-                _txtLog.ScrollToCaret();
-            });
+            }
+            if (sb.Length == 0) return;
+            _txtLog.AppendText(sb.ToString());
+            if (_txtLog.Lines.Length > 800)
+            {
+                // 裁剪前必须先把被裁掉的部分落盘。
+                // 原来的实现直接"砍掉最前 300 行"，而启动过程与第一次失败的原因
+                // 恰好就在最前面——用户和我们事后都查不到根因，这是日志最大的缺陷。
+                var cur = _txtLog.Lines;
+                int cut = 300;
+                if (cut > cur.Length) cut = cur.Length;
+                var dropped = new string[cut];
+                Array.Copy(cur, 0, dropped, 0, cut);
+                AppendUiLogArchive(dropped);
+
+                var keep = new string[cur.Length - cut];
+                Array.Copy(cur, cut, keep, 0, keep.Length);
+                _txtLog.Lines = keep;
+            }
+            _txtLog.SelectionStart = _txtLog.TextLength;
+            _txtLog.ScrollToCaret();
         }
 
         // 把被裁掉的日志行追加到 %APPDATA%\ThunderPanSync\ui-log-YYYY-MM-DD.log
@@ -1363,6 +1400,9 @@ namespace ThunderPanSync
             _chkAutoStart.AutoSize = true;
             _chkAutoStart.ForeColor = Theme.TextPrimary;
             _chkAutoStart.Margin = new Padding(0, Theme.S(6), 0, 0);
+            // 6c：原生 CheckBox 的方框由主题引擎绘制，深色下是纯白小方块（整窗最亮）。
+            // 句柄建好后再套 DarkMode_Explorer；实测仍白就走自绘（见交付说明）。
+            _chkAutoStart.HandleCreated += delegate { Draw.SetThemeDeep(_chkAutoStart.Handle); };
             AddSettingRow(grid, 4, "启动项：", _chkAutoStart);
 
             _btnSave = MakeButton("保存设置", 120);
@@ -1505,6 +1545,10 @@ namespace ThunderPanSync
             else if (!_haveStatus) s = _engineRunning ? UiState.Running : UiState.Ready;
             else if (_stCircuitOpen) s = UiState.Paused;
             else if (_stDirsCount == 0) s = UiState.NotConfigured;
+            // N1：手动「立即同步一次」期间引擎的 running 仍是 false（它只在自动轮里置位），
+            // 只看 _stRunning 会让胶囊说「待命（没在上传）」而同屏进度行在跑 —— 自相矛盾。
+            // 只要本轮还在跑（_roundActive），就是"正在上传"，与自动轮同一个说法。
+            else if (_roundActive) s = UiState.Running;
             else if (_stRunning) s = UiState.Running;
             else s = UiState.Ready;
             _uiState = s;
@@ -1549,6 +1593,9 @@ namespace ThunderPanSync
                 text = "状态不可用（最后更新 " + _lastStatusAt.ToString("HH:mm") + "）";
                 c = Theme.Danger;
                 k = StatusPill.PillKind.Error;
+                // N2：状态过期只改局部文字不会影响按钮 —— ResolvePrimaryAction 读的是 _uiState。
+                // 不同步回写的话，引擎失联时「立即同步一次」仍然可点（点了必然失败）。
+                _uiState = UiState.Error;
             }
 
             if (_pill != null)
@@ -1677,6 +1724,11 @@ namespace ThunderPanSync
                 _roundStartedAt = DateTime.MinValue;
                 int up = GetInt(d, "uploaded", -1);
                 int bad = GetInt(d, "failed", -1);
+                // 第三态：已上传但云端暂时核实不了。引擎把它单独计数（既不是成功也不是失败），
+                // 界面必须单独说，否则"整轮全 unverified"会被说成"没有需要上传的新文件"。
+                int unv = GetInt(d, "unverified", 0);
+                // 必修 16：有几个监视目录这轮根本没看到（引擎侧计入 roundFailed）
+                int miss = GetInt(d, "missingDirs", 0);
 
                 if (!string.IsNullOrEmpty(fatalCode))
                 {
@@ -1694,11 +1746,31 @@ namespace ThunderPanSync
                 {
                     _flatProgress.Indeterminate = false;
                     _flatProgress.Ratio = bad == 0 && up == 0 && total == 0 ? 0 : 1;
-                    _flatProgress.FillColor = Theme.Ok;
-                    _lblProgress.ForeColor = Theme.Ok;
-                    _lblProgress.Text = up == 0
-                        ? "本轮已结束 · 没有需要上传的新文件"
-                        : "本轮已结束 · 成功上传 " + up + " 个文件";
+                    if (unv > 0)
+                    {
+                        // 不许说成成功（绿色）：可能压根没入库；也不许说成失败（红色）：文件很可能在云端。
+                        // 用户最担心的是重复上传，所以文案必须带上"不会重传"。
+                        _flatProgress.FillColor = Theme.Warn;
+                        _lblProgress.ForeColor = Theme.Warn;
+                        _lblProgress.Text = "本轮已结束 · " + unv + " 个文件待核实（已上传，下一轮核对，不会重传）"
+                            + (up > 0 ? "；另有 " + up + " 个已确认" : "");
+                    }
+                    else if (miss > 0 && up > 0)
+                    {
+                        // 部分成功：文件传了，但至少一个监视文件夹整个不见了 —— 不能说"完成"
+                        _flatProgress.FillColor = Theme.Warn;
+                        _lblProgress.ForeColor = Theme.Warn;
+                        _lblProgress.Text = "本轮已结束 · 成功上传 " + up + " 个文件；另有 " + miss
+                            + " 个监视文件夹找不到了（请检查是否被删除或改名）";
+                    }
+                    else
+                    {
+                        _flatProgress.FillColor = Theme.Ok;
+                        _lblProgress.ForeColor = Theme.Ok;
+                        _lblProgress.Text = up == 0
+                            ? "本轮已结束 · 没有需要上传的新文件"
+                            : "本轮已结束 · 成功上传 " + up + " 个文件";
+                    }
                 }
                 else
                 {
@@ -1829,9 +1901,24 @@ namespace ThunderPanSync
                     // 文件夹列表：内容变了才重建（重建会丢选中、也会闪）
                     var want = new List<string>();
                     object wd;
-                    if (cfg.TryGetValue("watchDirs", out wd) && wd is object[])
+                    // 必修 17：JavaScriptSerializer 的 JSON 数组不一定反序列化成 object[]
+                    // （实测：config 里有目录，界面却永远显示"文件夹 0 / 还没有添加文件夹"）。
+                    // 所以按 IEnumerable 兜底，两种形态都收。
+                    if (cfg.TryGetValue("watchDirs", out wd) && wd != null && !(wd is string))
                     {
-                        foreach (var x in (object[])wd) want.Add(Convert.ToString(x));
+                        var arr = wd as object[];
+                        if (arr != null)
+                        {
+                            foreach (var x in arr) { if (x != null) want.Add(Convert.ToString(x)); }
+                        }
+                        else
+                        {
+                            var en = wd as System.Collections.IEnumerable;
+                            if (en != null)
+                            {
+                                foreach (var x in en) { if (x != null) want.Add(Convert.ToString(x)); }
+                            }
+                        }
                     }
                     bool same = (want.Count == _lvDirs.Items.Count);
                     if (same)
@@ -1872,6 +1959,18 @@ namespace ThunderPanSync
                     _stFailedTotal = GetInt(st, "failedTotal", 0);
                     _chipUploaded.Value = _stUploadedTotal.ToString();
                     _chipFailed.Value = _stFailedTotal.ToString();
+
+                    // 待核实：数字变了才写一行日志，避免每 10 秒刷一次
+                    _stUnverifiedTotal = GetInt(st, "unverifiedTotal", 0);
+                    if (_stUnverifiedTotal != _stUnverifiedShown)
+                    {
+                        _stUnverifiedShown = _stUnverifiedTotal;
+                        if (_stUnverifiedTotal > 0)
+                            AppendLog("[待核实] " + _stUnverifiedTotal + " 个文件已上传但云端暂时无法确认；"
+                                + "下一轮会自动核对，不会重复上传。");
+                        else
+                            AppendLog("[待核实] 待核实文件已全部核对完成。");
+                    }
 
                     FillFailedList(st);
 
@@ -2087,6 +2186,7 @@ namespace ThunderPanSync
             {
                 if (_tickTimer != null) { try { _tickTimer.Stop(); _tickTimer.Dispose(); } catch (Exception) { } }
                 if (_pollTimer != null) { try { _pollTimer.Stop(); _pollTimer.Dispose(); } catch (Exception) { } }
+                if (_logTimer != null) { try { _logTimer.Stop(); _logTimer.Dispose(); } catch (Exception) { } }
             }
             base.Dispose(disposing);
         }

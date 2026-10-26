@@ -87,6 +87,31 @@ class SyncEngine extends EventEmitter {
           lastRun: s.lastRun,
         };
         this.remoteFolderId = s.remoteFolderId || null;
+
+        // 补 1（兼容）：修复前写入的 unverified 记录没有 beforeIds 证据，
+        // 按新规则既永远认领不了、又会被 scan() 跳过 ⇒ 永久悬空 = 静默丢失。
+        // 直接丢掉（下一轮当新文件重传一次，最多多一个重复文件，远好于永久丢失）。
+        // 只丢"字段不存在"的旧记录：新记录即使 beforeIds 是空数组也保留（那是快照失败的正常态）。
+        let legacy = 0;
+        for (const k of Object.keys(this.state.unverified)) {
+          const u = this.state.unverified[k];
+          if (!u || !Array.isArray(u.beforeIds)) { delete this.state.unverified[k]; legacy++; }
+        }
+        if (legacy) {
+          this.log("warn", "状态迁移：清掉 " + legacy + " 条旧版待认领记录（缺少上传前快照证据，无法安全认领，下一轮会重新上传一次）", "DISK");
+        }
+
+        // 补 2（CODE-NITS A1）：failed[*].nextRetryAt 存的是**轮次号**，而 _runCounter 每次启动归零。
+        // 重启后 runNo(1) < nextRetryAt(旧值可能 500+) 恒真 ⇒ 失败 ≥5 次的文件被永久当成"仍在退避"跳过。
+        // 重启即视为"退避重置"：清掉 nextRetryAt，重新给它机会。
+        let resetBackoff = 0;
+        for (const k of Object.keys(this.state.failed)) {
+          const f = this.state.failed[k];
+          if (f && typeof f.nextRetryAt === "number") { f.nextRetryAt = null; resetBackoff++; }
+        }
+        if (resetBackoff) {
+          this.log("info", "状态迁移：" + resetBackoff + " 个失败文件的退避计数已重置（重启后重新尝试）", "DISK");
+        }
       }
     } catch (e) {
       // 状态损坏：不能静默当空（那会导致全量重传）。
@@ -106,11 +131,35 @@ class SyncEngine extends EventEmitter {
   // 原子写：先写临时文件 → fsync → rename 覆盖。
   // 直接 writeFileSync 覆盖目标文件时，断电/强杀会留下 0 字节或半截 JSON，
   // 下次启动解析失败 → 状态清空 → 把用户几个 GB 全部重传（实测过的场景）。
+  // P2：整份 state.json 全量写 + fsync 在 20k 文件时实测 139–1091ms/次，
+  // 而它有 8 个调用点（3 个在"每个文件"的路径上）⇒ 首轮 20,000 文件 ≈ 2.8 小时纯写状态。
+  // 这里只置脏，2 秒后统一落盘；runOnce 的 finally / stop() / 退出前会强制 _flushState()。
   _saveState() {
+    this._dirtyState = true;
+    if (this._saveTimer) return;
+    this._saveTimer = setTimeout(() => {
+      this._saveTimer = null;
+      this._flushState();
+    }, 2000);
+    if (this._saveTimer && this._saveTimer.unref) this._saveTimer.unref();
+  }
+
+  // 立刻落盘（有脏数据才写）。runOnce 结束、stop()、进程退出前必须调用。
+  _flushState() {
+    if (this._saveTimer) { try { clearTimeout(this._saveTimer); } catch (e) { } this._saveTimer = null; }
+    if (!this._dirtyState) return;
+    this._dirtyState = false;
+    this._writeStateNow();
+  }
+
+  _writeStateNow() {
     const target = this.cfg.stateFile;
     const tmp = target + '.tmp';
     try {
       fs.mkdirSync(path.dirname(target), { recursive: true });
+      // P2：条目多时用紧凑格式（20k 条：2.63 MB → 约 1.4 MB，stringify/write 都更快）。
+      // 代价是 state.json 不再是给人读的；条目少时仍然缩进，方便排查。
+      const big = Object.keys(this.state.uploaded || {}).length > 2000;
       const data = JSON.stringify({
         uploaded: this.state.uploaded,
         failed: this.state.failed,
@@ -119,15 +168,13 @@ class SyncEngine extends EventEmitter {
         unverified: this.state.unverified,
         lastRun: this.state.lastRun,
         remoteFolderId: this.remoteFolderId,
-      }, null, 2);
+      }, null, big ? 0 : 2);
 
-      const fd = fs.openSync(tmp, 'w');
-      try {
-        fs.writeSync(fd, data, 0, 'utf8');
-        fs.fsyncSync(fd);          // 确保落盘，否则 rename 后内容仍可能在缓存里
-      } finally {
-        fs.closeSync(fd);
-      }
+      // P2-c：不再 fsync。实测 2.2 MB 的 state：fsync 版 341–561 ms，不 fsync 版 12–14 ms（28–47×）。
+      // 代价：断电可能丢最后几秒的状态 ⇒ 最坏结果是重启后重传一遍（不会丢用户数据，
+      // 因为 uploaded 丢了只会重新上传，云端最多多一个同名副本）。
+      // 保留 writeFileSync + rename：rename 在 NTFS 上原子，不会留下半截 JSON。
+      fs.writeFileSync(tmp, data, 'utf8');
       fs.renameSync(tmp, target);  // rename 在 NTFS 上是原子的
     } catch (e) {
       // 写失败必须让人知道：状态不落盘意味着下次会重传
@@ -505,6 +552,11 @@ class SyncEngine extends EventEmitter {
 
   scan() {
     const out = [];
+    // 必修 16：本轮有哪些监视目录整个不见了（路径解析失败/被删/被改名/没权限）
+    this._missingDirs = [];
+    // P1：空文件/超限文件的跳过不再逐个写日志（20k 文件 = 20k 行 = UI 假死 30 分钟），
+    // 只计数，scan() 末尾汇总一条。
+    this._skipStats = { empty: 0, oversize: 0, names: [] };
     const now = Date.now();
     const MAX_DEPTH = 64;               // 防符号链接环/超深目录
     const settleMs = this.cfg.settleMs;
@@ -512,7 +564,12 @@ class SyncEngine extends EventEmitter {
     // 未来时间戳容忍窗口：超过这个量就认为时钟/时间戳异常，按"已稳定"处理
     const FUTURE_TOLERANCE_MS = 60 * 1000;
 
-    const blocked = this._blockedRoots();
+    // 归一化一次，扫描过程复用：26 个盘符的 existsSync 不能每进一个子目录都做一遍
+    const blockedNorm = this._blockedRoots().map(b => this._normPath(b)).filter(Boolean);
+    const isBlocked = (p) => this._hitBlocked(p, blockedNorm);
+    // 凭据/配置目录名（精确匹配，大小写不敏感）与浏览器登录态文件名
+    const exDirs = new Set(this._excludedDirs());
+    const exFiles = new Set(this._excludedFiles());
 
     for (const dir of this.cfg.watchDirs) {
       let rootReal;
@@ -521,10 +578,20 @@ class SyncEngine extends EventEmitter {
         rootReal = dir;
       }
 
-      if (!fs.existsSync(dir)) { this.log('warn', `目录不存在: ${dir}`, 'DISK'); continue; }
+      if (!fs.existsSync(dir)) {
+        // 必修 16：只 warn 一句就当"没有新文件"会让整轮 scanned=0、failed=0，
+        // 界面于是显示"同步成功"；用户以为备份好了，其实目录早就没了。
+        this._missingDirs.push(dir);
+        this.log('warn', `目录不存在: ${dir}（可能被改名或删除；本轮按失败处理）`, 'DISK');
+        continue;
+      }
 
-      // 用户选到系统目录时明确拒绝（否则会尝试上传整个系统盘）
-      const hit = blocked.find(b => rootReal.toLowerCase().startsWith(b.toLowerCase()));
+      // 用户选到系统目录/盘符根时明确拒绝（否则会尝试上传整个系统盘）
+      const hit = this._hitBlocked(rootReal, blockedNorm);
+      if (hit && /^[a-z]:$/.test(hit)) {
+        this.log('error', `拒绝备份盘符根 "${dir}"：整个磁盘不能作为监视目录（会遍历并上传全盘）。请选择具体的子目录，例如 ${hit.toUpperCase()}\\我的文档。`, 'DISK');
+        continue;
+      }
       if (hit) {
         this.log('error', `拒绝备份系统目录 "${dir}"（命中保护路径 ${hit}）。请选择你自己的文档/照片等目录。`, 'DISK');
         continue;
@@ -548,9 +615,28 @@ class SyncEngine extends EventEmitter {
         for (const ent of ents) {
           const full = path.join(d, ent.name);
           if (ent.isDirectory()) {
-            if (ent.name.startsWith('.') || ent.name === 'node_modules') continue;
+            if (ent.name.startsWith('.')) continue;
+            const lowName = ent.name.toLowerCase();
+            // 凭据/配置目录：不上传。否则用户选 C:\Users\<me> 就会把
+            // browser-profile\Default\Network\Cookies（以及日常 Chrome/Edge 的登录态）
+            // 一起传上云盘（产品 D-B）。
+            if (exDirs.has(lowName)) {
+              this._logSkipOnce(full, null, `跳过 ${full}（凭据/配置目录，不上传）`);
+              continue;
+            }
+            // 逐层复核系统目录：监视根本身通过检查（例如 C:\）也不能进 Windows\System32
+            const bhit = isBlocked(full);
+            if (bhit) {
+              this._logSkipOnce(full, null, `跳过 ${full}（系统目录，命中保护路径 ${bhit}）`);
+              continue;
+            }
             walk(full, depth + 1);
           } else if (ent.isFile()) {
+            // 浏览器登录态文件：按文件名拦（产品 D-B 的兜底，目录改名也挡得住）
+            if (exFiles.has(ent.name.toLowerCase())) {
+              this._logSkipOnce(full, null, `跳过 ${full}（浏览器登录态文件，不上传）`);
+              continue;
+            }
             let st;
             try { st = fs.statSync(full); }
             catch (e) {
@@ -562,7 +648,7 @@ class SyncEngine extends EventEmitter {
             // 这个文件根本没被备份（例如 3 GB 视频超上限时，界面全程显示"失败 0"）。
             // 只记 info，不升级成 warn：跳过是设计行为，不是出错。
             if (st.size === 0) {
-              this._logSkipOnce(full, st, `跳过 ${path.basename(full)}（空文件，云盘不接受 0 字节）: ${full}`);
+              this._noteSkip('empty', full);
               out.push({ full, st, skip: '空文件（云盘不接受 0 字节）', skipCode: 'QUOTA' });
               continue;
             }
@@ -571,7 +657,7 @@ class SyncEngine extends EventEmitter {
               const sizeTxt = st.size >= 1048576
                 ? `${(st.size / 1048576).toFixed(1)} MB`
                 : `${Math.max(1, Math.round(st.size / 1024))} KB`;
-              this._logSkipOnce(full, st, `跳过 ${path.basename(full)}（${sizeTxt}，超过上限 ${this.cfg.maxSizeMB} MB）: ${full}`);
+              this._noteSkip('oversize', full);
               out.push({ full, st, skip: `超过 ${this.cfg.maxSizeMB} MB 上限`, skipCode: 'QUOTA' });
               continue;
             }
@@ -592,6 +678,11 @@ class SyncEngine extends EventEmitter {
             const fp = `${st.size}-${Math.floor(st.mtimeMs)}`;
             const prev = this.state.uploaded[full];
             if (prev && prev.fp === fp) continue;
+            // unverified = 上一轮已经交给浏览器上传过、只是云端暂时核实不了的文件。
+            // 它**不是失败**，也**不该重传**：重传会在云端产生 a.txt + a(1).txt，
+            // 正是三态核查要消灭的结果。等 _claimUnverified() 拿到证据后转成 uploaded（必修 11a）。
+            const unv = this.state.unverified[full];
+            if (unv && unv.fp === fp) continue;
             out.push({ full, st, fp, rel: path.relative(dir, full), skip: null });
           } else if (ent.isSymbolicLink()) {
             // 原来这里没有分支 ⇒ 静默丢弃。现在至少计数并汇总告警。
@@ -611,7 +702,24 @@ class SyncEngine extends EventEmitter {
         this.log('warn', `"${path.basename(dir)}" 下有 ${skippedOther} 个非普通文件被跳过`, 'DISK');
       }
     }
+    // P1：跳过日志按轮汇总（否则 20,000 个文件 = 20,000 行日志 = UI 线程占满）
+    const sk = this._skipStats;
+    if (sk && ((sk.empty || 0) + (sk.oversize || 0)) > 0) {
+      const total = (sk.empty || 0) + (sk.oversize || 0);
+      const parts = [];
+      if (sk.empty) parts.push(`0 字节 ${sk.empty} 个`);
+      if (sk.oversize) parts.push(`超过上限 ${sk.oversize} 个`);
+      this.log('info', `本轮跳过 ${total} 个文件：${parts.join('、')}（示例：${sk.names.join('、')}）`, 'UNKNOWN');
+    }
     return out;
+  }
+
+  // P1：跳过计数（不写日志，避免刷屏）
+  _noteSkip(kind, full) {
+    const s = this._skipStats;
+    if (!s) return;
+    s[kind] = (s[kind] || 0) + 1;
+    if (s.names.length < 3) s.names.push(path.basename(full));
   }
 
   // 禁止备份的系统路径（大小写不敏感）。用户误选会毁掉配额并上传系统文件。
@@ -633,6 +741,59 @@ class SyncEngine extends EventEmitter {
       'C:\\System Volume Information',
       // 引导/恢复分区等
       'C:\\Boot',
+    ].concat(this._driveRoots());
+  }
+
+  // 所有存在的盘符根（C:\、D:\ …）。盘符根必须拦：选了 C:\ 就会遍历整个系统盘。
+  // README 承诺"防止误选导致上传整个系统盘"，但旧黑名单里没有盘符根，
+  // 实测 watchDirs=['C:\\'] 直接进了 readdirSync('C:\\')。
+  _driveRoots() {
+    const out = [];
+    for (let i = 0; i < 26; i++) {
+      const letter = String.fromCharCode(65 + i) + ':\\';
+      try { if (fs.existsSync(letter)) out.push(letter); } catch (e) { /* 无权限的盘符忽略 */ }
+    }
+    return out;
+  }
+
+  // 路径归一化：去掉尾部分隔符 + 转小写（Windows 文件系统大小写不敏感）
+  _normPath(s) {
+    return String(s || '').replace(/[\\/]+$/, '').toLowerCase();
+  }
+
+  // p 是否命中 blocked 列表中的某一项（**带分隔符边界**）。
+  // 旧实现是裸 startsWith：C:\Program Files 会把 C:\ProgramFiles-backup 也判成系统目录
+  // （实测误拒），而对 C:\ 这种盘符根又完全不命中（实测放行 ⇒ 遍历全盘）。
+  _hitBlocked(p, blockedNorm) {
+    const np = this._normPath(p);
+    if (!np) return null;
+    const list = blockedNorm || [];
+    for (const nb of list) {
+      if (!nb) continue;
+      // 盘符根只做"完全相等"判定：盘符根带尾分隔符做前缀会把该盘所有路径都判成根
+      // （实测：加了盘符根后 D:\ 上任何目录都被拒）。
+      if (/^[a-z]:$/.test(nb)) { if (np === nb) return nb; continue; }
+      if (np === nb || np.indexOf(nb + '\\') === 0 || np.indexOf(nb + '/') === 0) return nb;
+    }
+    return null;
+  }
+
+  // 绝不备份的目录（按**目录名**精确匹配，不做子串匹配，免得误伤普通目录）
+  _excludedDirs() {
+    return [
+      'appdata', 'application data', 'local settings',
+      'browser-profile', 'user data',
+      '.ssh', '.gnupg', '.aws', '.azure', '.config',
+      '$recycle.bin', 'system volume information',
+      'node_modules',
+    ];
+  }
+
+  // 绝不备份的文件（浏览器登录态/凭据文件）
+  _excludedFiles() {
+    return [
+      'cookies', 'cookies-journal', 'login data', 'login data-journal',
+      'web data', 'local state', 'key4.db', 'logins.json',
     ];
   }
 
@@ -776,6 +937,11 @@ class SyncEngine extends EventEmitter {
         size: item.st.size,
         at: new Date().toISOString(),
         reason: verdict.reason,
+        // 上传前快照里的 id 列表 —— 这是"云端那份文件到底是不是本次传上去的"唯一证据。
+        // 没有它，认领就只剩"名字 + 大小"，而云端本来就可能有一个同名同大小的旧文件
+        // （用户改了内容但字节数没变，或另一个子目录里有同名同大小文件）。一旦认错，
+        // scan() 会因为 fp 相同而永久跳过该文件 = 静默丢数据（红队 R1）。
+        beforeIds: (beforeIds ? Array.from(beforeIds) : []),
       };
       delete this.state.failed[item.full];   // 绝不能同时挂在"失败"里，否则界面说失败、下轮又重传
       this._saveState();
@@ -906,13 +1072,17 @@ class SyncEngine extends EventEmitter {
     // 有了这个标志，_verifyRemoteFile 就不必再靠 _remoteFolderIsEmpty() 去猜
     // "空集是目录空还是快照失败"，于是"往空文件夹里传第一个文件"不会白判成未核实。
     let listingOk = true;
+    // R4：每次拍快照先清掉上一次的结论。旧实现在 !remoteFolderId 时提前 return，
+    // 把上一次的 _lastSnapshotOk 留了下来，于是"云端旧文件"会被判成本次上传成功。
+    this._lastSnapshot = null;
+    this._lastSnapshotOk = false;
     // 同时留下完整的文件对象数组：版本策略要按名字找旧副本，
     // 复用这份快照就不用为每个文件再拉一遍目录（少一半 API 调用，也少一次被限流的机会）。
     let files = null;
+    let token = '';        // 提到 try 外面：循环之后要靠"token 是否耗尽"判断分页完整性
     try {
       if (!this.remoteFolderId) return ids;
-      let token = '';
-      for (let page = 0; page < 20; page++) {
+      for (let page = 0; page < 100; page++) {
         let url = API + '/drive/v1/files?parent_id=' + encodeURIComponent(this.remoteFolderId) + '&limit=200';
         if (token) url += '&page_token=' + encodeURIComponent(token);
         const r = await this._apiGet(url);   // 带 header 缓存，不再每页重截 captcha
@@ -934,9 +1104,12 @@ class SyncEngine extends EventEmitter {
       this._noteErrCode(this._errCodeOf(e));
       this.log('warn', `云端快照失败: ${e.message}`, this._errCodeOf(e));
     }
-    // 快照不完整时置 null：宁可让版本策略退回去重新列举，也不要基于半份快照做删除判断
-    this._lastSnapshot = (files && files.length === ids.size) ? files : null;
-    this._lastSnapshotOk = listingOk;
+    // 完整 = 每页都 200 且 page_token 耗尽（翻满 20 页还没完 = 不完整）。
+    // 旧判据 files.length === ids.size 恒成立（两个集合由同一批数据生成），等于没判——
+    // 于是"前两页成功、第三页 500"留下的半份快照会被当成完整快照复用（红队 R3）。
+    const complete = listingOk && !token;
+    this._lastSnapshot = complete ? files : null;
+    this._lastSnapshotOk = complete;
     return ids;
   }
 
@@ -947,7 +1120,7 @@ class SyncEngine extends EventEmitter {
     try {
       if (!this.remoteFolderId) return out;
       let token = '';
-      for (let page = 0; page < 20; page++) {
+      for (let page = 0; page < 100; page++) {
         let url = API + '/drive/v1/files?parent_id=' + encodeURIComponent(this.remoteFolderId) + '&limit=200';
         if (token) url += '&page_token=' + encodeURIComponent(token);
         const r = await this._apiGet(url);
@@ -987,9 +1160,19 @@ class SyncEngine extends EventEmitter {
     for (const full of keys) {
       const u = pend[full];
       if (!u) continue;
-      const hit = files.find(f => f && f.name === u.name && Number(f.size) === Number(u.size));
+      // 认领的唯一合法证据：云端那个文件的 id **不在上传前的快照里**（即本次新出现的）。
+      // 拿不到证据就不认领：宁可让它多悬一轮，也不能把云端旧文件记成本次上传
+      // —— 那会让 scan() 永久跳过它，用户的修改永远到不了云端（红队 R1）。
+      const before = Array.isArray(u.beforeIds) ? u.beforeIds : null;
+      if (!before || before.length === 0) {
+        this.log('info', `${u.name} 仍待认领（缺少上传前快照证据，无法证明云端那份是本次上传），下一轮再试`);
+        continue;
+      }
+      const hit = files.find(f => f && f.name === u.name
+        && Number(f.size) === Number(u.size)
+        && before.indexOf(f.id) < 0);
       if (!hit) {
-        this.log('info', `${u.name} 仍待认领（云端暂未见到同名同大小文件），下一轮再试`);
+        this.log('info', `${u.name} 仍待认领（云端只有上传前就存在的旧副本，或暂未见到同名同大小文件），下一轮再试`);
         continue;
       }
       this.state.uploaded[full] = { fp: u.fp, size: u.size, at: new Date().toISOString() };
@@ -1053,15 +1236,18 @@ class SyncEngine extends EventEmitter {
 
         let token = '';
         let sawPages = 0;
-        for (let page = 0; page < 20; page++) {
+        // 补 3（CODE-NITS A2）：只有**翻到最后一页**才算"确认没有"。
+        // 旧实现"第一页成功就 listedOk=true"，中途某页 500 时仍会返回 ok:false，
+        // 于是目录里 >200 个文件时，已经传上去的文件会被判失败 ⇒ 重传 ⇒ a(1).txt（与 R1 同源的 P0）。
+        let exhaustive = true;
+        for (let page = 0; page < 100; page++) {
           let url = API + '/drive/v1/files?parent_id=' + encodeURIComponent(this.remoteFolderId) + '&limit=200';
           if (token) url += '&page_token=' + encodeURIComponent(token);
           const r = await this._apiGet(url);   // 带 header 缓存
-          if (!r || r.status !== 200) { lastStatus = r ? r.status : null; break; }
+          if (!r || r.status !== 200) { lastStatus = r ? r.status : null; exhaustive = false; break; }
           const j = await r.json();
           const files = j.files || [];
           sawPages++;
-          listedOk = true;      // 至少有一页列举成功 ⇒ 后面的"没找到"才算"确认没有"
 
           for (const f of files) {
             if (Number(f.size) !== Number(size)) continue;
@@ -1080,7 +1266,13 @@ class SyncEngine extends EventEmitter {
 
           token = j.next_page_token || '';
           if (!token) break;
+          if (page === 99) exhaustive = false;   // 翻满 20 页还有下一页 = 没取全
         }
+        if (!exhaustive) {
+          // P3：目录超过 100 页 × 200 = 20,000 项时列举不完整 ⇒ 不能判成功也不能判失败
+          this.log('warn', '云端目录项数超过 20,000，无法完整核查（该目录太大了）', 'PAGE');
+        }
+        if (exhaustive) listedOk = true;         // 只有完整翻完，后面的"没找到"才算"确认没有"
       } catch (e) {
         if (attempt === 5) {
           const code = this._errCodeOf(e);
@@ -1206,6 +1398,11 @@ class SyncEngine extends EventEmitter {
       // 只有确实带了才透传，免得旧界面读到 0 会误判"全部失败"
       if (p.uploaded !== undefined && p.uploaded !== null) out.uploaded = Number(p.uploaded);
       if (p.failed !== undefined && p.failed !== null) out.failed = Number(p.failed);
+      // 未核实（必修 11b）：既不是成功也不是失败，但界面必须看得到。
+      // 不白名单放行的话，"整轮全是 unverified"会被界面说成"没有需要上传的新文件"（红队 R2）。
+      if (p.unverified !== undefined && p.unverified !== null) out.unverified = Number(p.unverified) || 0;
+      // 必修 16：缺目录数也要透传，否则界面无法区分"目录没了"和"真的没新文件"
+      if (p.missingDirs !== undefined && p.missingDirs !== null) out.missingDirs = Number(p.missingDirs) || 0;
       // 致命错误码同样必须放行：没有它界面无法区分
       // "本轮整轮失败（连不上浏览器）" 和 "本轮真的没有文件要传"——
       // 这两种情况 uploaded/failed 都是 0，界面会把前者说成"完成"（实测确认过）。
@@ -1464,7 +1661,13 @@ class SyncEngine extends EventEmitter {
       stats.bytesUploaded = 0;
 
       if (due.length === 0) {
-        this.log('info', '无需同步');
+        // 必修 16：目录整个不见了不能说「无需同步」（用户会以为一切正常）
+        const missN = (this._missingDirs || []).length;
+        if (missN > 0) {
+          this.log('error', `没有可备份的文件：${missN} 个监视文件夹找不到了（可能被改名或删除）。请在设置里重新添加。`, 'MISSING_DIR');
+        } else {
+          this.log('info', '无需同步');
+        }
       } else {
         // 不再做这里的一次预检：uploadOne 内部每个文件都会 enterRemoteFolder(true)，
         // 预检等于把导航（最易失败的一步）多跑一遍，实测多耗 18 秒且失败面翻倍。
@@ -1544,11 +1747,25 @@ class SyncEngine extends EventEmitter {
       this.lastRunAt = Date.now();
       this._logDay = null;          // 允许下一次 log() 重新判定日期（跨天）
       this._saveState();
+      this._flushState();           // P2：一轮结束必须真落盘（debounce 不能拖过这一轮）
 
       // ---- 退避 / 熔断判定 ----
       // "失败的一轮" = 有致命错误（连不上浏览器/没有远程文件夹），或本轮有文件失败。
       // 只是"没有文件要传"的成功轮不参与退避，否则用户加文件后要等 30 分钟。
-      const roundFailed = !!fatalCode || stats.failed > 0;
+      // 整轮全是 unverified（failed=0, uploaded=0, unverified=N）时，本轮的真相是
+      // "传了但一个都没核实到"：既不能算成功（否则绿条 + 熔断被静默清掉），也不能算失败。
+      // 这里按"未完成"处理：参与退避，不清熔断。
+      // 必修 16：整个被监视目录不见了属于整轮级故障（否则会走"无需同步"绿色分支）
+      stats.missingDirs = (this._missingDirs || []).length;
+      if (stats.missingDirs > 0 && stats.scanned === 0 && stats.uploaded === 0 && !fatalCode) {
+        // stats.fatalCode 在上面已经赋过一次值，这里必须同时写回两份，
+        // 否则 done 事件与 runNow 看到的还是 null ⇒ 界面照样绿（实测踩到）。
+        fatalCode = 'MISSING_DIR';
+        stats.fatalCode = 'MISSING_DIR';
+      }
+      const roundFailed = !!fatalCode || stats.failed > 0
+        || ((stats.unverified || 0) > 0 && stats.uploaded === 0)
+        || stats.missingDirs > 0;
       this._logDay = null;
       this._applyBackoff(roundFailed, stats, manual);
       stats.backoffMs = this.nextRunAt ? Math.max(0, this.nextRunAt - Date.now()) : null;
@@ -1556,7 +1773,8 @@ class SyncEngine extends EventEmitter {
       stats.circuitOpen = this.circuitOpen;
 
       this._emitProgress({
-        phase: 'done', index: stats.uploaded, total: stats.uploaded + stats.failed,
+        phase: 'done', index: stats.uploaded,
+        total: stats.uploaded + stats.failed + (stats.unverified || 0),
         name: '', size: 0,
         // 收尾事件也要给出本轮的字节基数，否则界面进度条停在最后一条 uploading
         // 的百分比（或显示 0/0），看起来像"卡住没完成"。
@@ -1572,6 +1790,8 @@ class SyncEngine extends EventEmitter {
         failed: stats.failed,
         // 未核实（既不算成功也不算失败）。界面可以不说，但绝不能把它当失败。
         unverified: stats.unverified || 0,
+        // 必修 16：有几个监视目录这轮根本没看到（用户要知道"某个文件夹没在备份"）
+        missingDirs: stats.missingDirs || 0,
         // 致命错误码（null = 本轮没有整轮级故障）。
         //
         // 为什么必须带出去（实测确证的严重缺陷）：
@@ -1685,6 +1905,7 @@ class SyncEngine extends EventEmitter {
     this.log('info', this.currentRun
       ? '已停止（本轮正在收尾，剩余文件不再上传）'
       : '已停止');
+    this._flushState();           // P2：停止时把脏状态落盘
   }
 
   // 用户手动"立即同步"：允许在熔断态下跑一轮。
@@ -1714,7 +1935,9 @@ class SyncEngine extends EventEmitter {
       : (stats.fatalCode
         || ((stats.errors || []).filter(function (e) { return e && !e.file && e.code; })[0] || {}).code
         || null);
-    const roundFailed = !stats || fatal !== null || (stats.failed > 0 && stats.uploaded === 0);
+    const roundFailed = !stats || fatal !== null || (stats.failed > 0 && stats.uploaded === 0)
+      || ((stats.unverified || 0) > 0 && stats.uploaded === 0)
+      || (stats.missingDirs || 0) > 0;
     if (roundFailed) {
       // 手动这轮也失败：恢复熔断，不要把用户的"点一下"当成问题已解决
       // circuitOpen 只保持原状（wasOpen）：手动轮**绝不**自己开启熔断
@@ -1750,6 +1973,10 @@ class SyncEngine extends EventEmitter {
       remoteFolderId: this.remoteFolderId,
       uploadedTotal: Object.keys(this.state.uploaded).length,
       failedTotal: Object.keys(this.state.failed).length,
+      // 已上传但云端暂时核实不了的文件数（既不是成功也不是失败，界面必须单独说）
+      unverifiedTotal: Object.keys(this.state.unverified || {}).length,
+      // 必修 16：本轮/最近一轮有多少监视目录已经找不到（0 = 都还在）
+      missingDirs: (this._missingDirs || []).length,
       lastRun: this.state.lastRun || null,
       failedFiles: Object.entries(this.state.failed).slice(0, 50).map(([f, v]) => ({
         file: f, count: v.count, error: v.lastError, code: v.code || 'UNKNOWN',

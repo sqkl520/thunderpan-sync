@@ -82,6 +82,11 @@ namespace ThunderPanSync
             psi.RedirectStandardError = true;
             psi.StandardOutputEncoding = new UTF8Encoding(false);
             psi.StandardErrorEncoding = new UTF8Encoding(false);
+            // 必修 15（P0，中文用户完全不可用）：默认 StandardInput 的 StreamWriter 用
+            // Encoding.Default（中文 Windows = CP936/GBK），而 host.js 按 UTF-8 读 stdin
+            // ⇒ 中文路径变成 U+FFFD ⇒ "目录不存在" ⇒ 界面还报成功。
+            // .NET Framework 的 ProcessStartInfo 没有 StandardInputEncoding 属性，
+            // 所以这里不设它，改由 WriteLineUtf8() 直接往 BaseStream 写 UTF-8 字节。
             psi.WorkingDirectory = Path.GetDirectoryName(hostScript);
 
             // 数据目录通过环境变量传给宿主（安装目录只读，数据必须落到 %APPDATA%）
@@ -330,9 +335,10 @@ namespace ThunderPanSync
                 try { id = Convert.ToInt32(o["id"]); } catch { return; }
                 lock (_sync)
                 {
-                    _results[id] = line;
+                    // N3：没有等待者的响应直接丢弃。旧实现无条件写 _results，而超时的 Call
+                    // 只 Remove waiter、不 Remove 结果 ⇒ 字典只增不减（100 次超时 = 100 条常驻）。
                     ManualResetEventSlim ev2;
-                    if (_waiters.TryGetValue(id, out ev2)) ev2.Set();
+                    if (_waiters.TryGetValue(id, out ev2)) { _results[id] = line; ev2.Set(); }
                 }
             }
         }
@@ -356,6 +362,21 @@ namespace ThunderPanSync
         }
 
         /// <summary>同步调用一条命令，返回原始 JSON 响应行（超时返回 null）。</summary>
+        /// <summary>
+        /// 必修 15：往引擎子进程 stdin 写一行，**固定 UTF-8**。
+        /// 不能直接用 _proc.StandardInput.WriteLine(string)：.NET Framework 的 StreamWriter
+        /// 用 Encoding.Default（中文系统 = GBK），而 host.js 按 UTF-8 解析 ⇒ 中文路径全变
+        /// U+FFFD ⇒ 引擎认为目录不存在 ⇒ 一轮"同步成功"却什么都没备份（实测确认）。
+        /// </summary>
+        private void WriteLineUtf8(string s)
+        {
+            if (_proc == null) return;
+            byte[] bytes = new UTF8Encoding(false).GetBytes(s + "\n");
+            var bs = _proc.StandardInput.BaseStream;
+            bs.Write(bytes, 0, bytes.Length);
+            bs.Flush();
+        }
+
         public string Call(string cmd, Dictionary<string, object> prms, int timeoutMs)
         {
             // 引擎还没启动完（或已关闭）时，"写不进去"不是异常，只是"现在没人可问"。
@@ -384,8 +405,7 @@ namespace ThunderPanSync
 
             try
             {
-                _proc.StandardInput.WriteLine(_json.Serialize(req));
-                _proc.StandardInput.Flush();
+                WriteLineUtf8(_json.Serialize(req));
             }
             catch (Exception ex)
             {
@@ -399,6 +419,8 @@ namespace ThunderPanSync
             lock (_sync)
             {
                 _waiters.Remove(id);
+                // N3：超时也要把结果位清掉（响应若之后才回来，因没有 waiter 会被直接丢弃）
+                if (!got) _results.Remove(id);
                 string raw;
                 if (got && _results.TryGetValue(id, out raw))
                 {
@@ -452,8 +474,7 @@ namespace ThunderPanSync
                 {
                     try
                     {
-                        _proc.StandardInput.WriteLine("{\"id\":99999,\"cmd\":\"quit\"}");
-                        _proc.StandardInput.Flush();
+                        WriteLineUtf8("{\"id\":99999,\"cmd\":\"quit\"}");
                     }
                     catch { }
                     if (!_proc.WaitForExit(2000))
@@ -469,16 +490,6 @@ namespace ThunderPanSync
             _proc = null;
         }
 
-        /// <summary>
-        /// [FIX 4] 重启引擎：Shutdown + Start 的封装。
-        /// 实测（probe.exe restart / same / fast / new）：re-entry 本身可用，
-        /// 0 次超时、0 次假 fatal，node 子进程数在重启期间稳定为 1，结束后归 1（无泄漏）。
-        /// </summary>
-        public void Restart(string nodeExe, string hostScript, string dataDir)
-        {
-            Shutdown();
-            Start(nodeExe, hostScript, dataDir);
-        }
 
         /// <summary>关掉并释放上一个子进程（Start 重入前必须调用）。</summary>
         private void DisposeOldProcess()
