@@ -44,6 +44,19 @@ namespace ThunderPanSync
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
+            // DPI 缩放必须在创建任何窗口之前初始化。
+            // Theme.S() 用这个值把逻辑像素换算成实际像素；不初始化的话
+            // _scale 保持 0，S() 原样返回 —— 96 DPI 下看不出问题，
+            // 但在 125%/150% 缩放下整个界面的尺寸就全是错的。
+            try
+            {
+                using (var g = System.Drawing.Graphics.FromHwnd(IntPtr.Zero))
+                {
+                    Theme.InitScale(g.DpiX / 96f);
+                }
+            }
+            catch (Exception) { /* 取不到 DPI 就用 1.0，不影响启动 */ }
+
             // 数据目录：%APPDATA%\ThunderPanSync（安装目录只读，绝不能往那里写）
             var dataDir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),

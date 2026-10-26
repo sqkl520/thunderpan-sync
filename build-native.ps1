@@ -50,10 +50,29 @@ function Step($n, $msg) { Write-Host ""; Write-Host "[$n] $msg" -ForegroundColor
 Step 1 'Compile native C# UI'
 $native = Join-Path $Root 'native'
 $exe = Join-Path $native 'ThunderPanSync.exe'
-$srcs = @('Program.cs', 'MainForm.cs', 'EngineHost.cs', 'BrowserManager.cs') | ForEach-Object { Join-Path $native $_ }
+# Source list must include every .cs that participates in the product build.
+# Note: UiPreview.cs is a dev-only harness and is deliberately NOT listed here
+# (it has its own Main(), which would clash with Program.Main).
+$srcs = @(
+  'Program.cs',
+  'MainForm.cs',
+  'EngineHost.cs',
+  'BrowserManager.cs',
+  'Theme.cs',
+  'Drawing.cs',
+  'Widgets.cs',
+  'DarkForm.cs'
+) | ForEach-Object { Join-Path $native $_ }
 foreach ($s in $srcs) { if (-not (Test-Path $s)) { throw "missing source: $s" } }
 
-$cscArgs = @('/nologo', '/target:winexe', "/out:$exe",
+# app.manifest: declares DPI awareness and supportedOS.
+# Without supportedOS, .NET reports Environment.OSVersion as 6.2 instead of 10.0
+# (measured on this machine), which silently disables OS-capability checks.
+$manifest = Join-Path $native 'app.manifest'
+$manifestArg = @()
+if (Test-Path $manifest) { $manifestArg = @("/win32manifest:$manifest") }
+
+$cscArgs = @('/nologo', '/target:winexe', "/out:$exe") + $manifestArg + @(
   '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll', '/r:System.Web.Extensions.dll',
   '/r:System.Net.Http.dll',
   '/optimize+') + $srcs
@@ -65,6 +84,45 @@ if ($LASTEXITCODE -ne 0) {
   throw 'C# compile failed'
 }
 Write-Host ('  OK  {0:N0} B' -f (Get-Item $exe).Length) -ForegroundColor Green
+
+# ---------- 1b. smoke test: the exe must actually start ----------
+#
+# Why this exists (a real regression that cost a debugging round):
+#   csc happily embeds a MALFORMED win32 manifest and still exits 0.
+#   The exe then fails at process creation with
+#   "The application has failed to start because its side-by-side
+#    configuration is incorrect."
+#   The trigger was as trivial as a double-hyphen inside an XML comment
+#   (XML forbids two consecutive '-' inside comments).
+#
+#   Compile success proves nothing about loadability. So we start the exe,
+#   wait briefly, and fail the build if it is already gone. A working app
+#   stays alive (it has a window and a tray icon).
+if (Test-Path $manifest) {
+  Step '1b' 'Smoke test: exe can start'
+  $probe = $null
+  $err = $null
+  try {
+    $probe = Start-Process -FilePath $exe -PassThru -ErrorAction Stop
+  } catch {
+    $err = $_.Exception.Message
+  }
+  if ($err -ne $null) {
+    Write-Host ('  FAILED to start: ' + $err) -ForegroundColor Red
+    Write-Host '  Hint: the embedded manifest is invalid. Run this to see why:' -ForegroundColor Yellow
+    Write-Host '    try { [xml](Get-Content native\app.manifest -Raw) } catch { $_.Exception.Message }' -ForegroundColor Yellow
+    Write-Host '  XML comments must not contain two consecutive hyphens.' -ForegroundColor Yellow
+    throw 'exe failed the load smoke test'
+  }
+  Start-Sleep -Milliseconds 2500
+  $still = Get-Process -Id $probe.Id -ErrorAction SilentlyContinue
+  if ($still -eq $null) {
+    Write-Host '  FAILED: exe exited immediately after start' -ForegroundColor Red
+    throw 'exe failed the load smoke test'
+  }
+  try { Stop-Process -Id $probe.Id -Force } catch { }
+  Write-Host '  OK  exe starts and stays alive' -ForegroundColor Green
+}
 
 # ---------- 2. assemble publish dir ----------
 Step 2 'Assemble publish directory'

@@ -17,7 +17,11 @@ using System.Web.Script.Serialization;
 
 namespace ThunderPanSync
 {
-    public class MainForm : Form
+    // 继承 DarkForm 而不是 Form：
+    //   Win10 上系统标题栏无法变深（DwmSetWindowAttribute 返回成功但视觉无效，已像素级实测），
+    //   唯一可靠办法是 FormBorderStyle=None + 自绘标题栏（拖动/最大化/关闭/边缘缩放/Aero Snap
+    //   都在 DarkForm 里实现了）。详见 DarkForm.cs 顶部注释与 docs/UI-SPEC.md。
+    public class MainForm : DarkForm
     {
         private readonly EngineHost _host = new EngineHost();
         private readonly JavaScriptSerializer _json = new JavaScriptSerializer();
@@ -25,11 +29,14 @@ namespace ThunderPanSync
         private readonly BrowserManager _browser;
 
         // 控件
-        private TabControl _tabs;
-        private ListView _lvDirs;
+        // 标签页用自绘 SegmentedTabs + 两个 Panel，不用原生 TabControl
+        // （原生 TabControl 的页体背景永远是浅色 #F0F0F0，无法改，见 BuildUi 里的说明）
+        private SegmentedTabs _tabStrip;
+        private Panel _pageHost, _pageMain, _pageSettings;
+        private DarkListView _lvDirs;
         private Button _btnAddDir, _btnDelDir;
         private TextBox _txtLog;
-        private ListView _lvFail;
+        private DarkListView _lvFail;
         private Button _btnSync, _btnStart, _btnStop, _btnSave, _btnOpenLog, _btnLogin;
         private TextBox _txtRemoteName, _txtInterval, _txtSettle, _txtMaxSize;
         private CheckBox _chkAutoStart;
@@ -169,8 +176,8 @@ namespace ThunderPanSync
                 f.Height = 620;
                 f.MinimumSize = new Size(600, 480);
                 f.StartPosition = FormStartPosition.CenterScreen;
-                f.BackColor = Color.FromArgb(38, 40, 44);
-                f.ForeColor = Color.Gainsboro;
+                f.BackColor = Theme.BgSurface;
+                f.ForeColor = Theme.TextPrimary;
                 f.FormBorderStyle = FormBorderStyle.Sizable;
                 f.MaximizeBox = false;
                 f.MinimizeBox = false;
@@ -179,7 +186,7 @@ namespace ThunderPanSync
                 var bottom = new Panel();
                 bottom.Dock = DockStyle.Bottom;
                 bottom.Height = 56;
-                bottom.BackColor = Color.FromArgb(30, 32, 36);
+                bottom.BackColor = Theme.BgBar;
                 bottom.Padding = new Padding(12, 12, 12, 12);
                 f.Controls.Add(bottom);
 
@@ -188,8 +195,8 @@ namespace ThunderPanSync
                 btnAccept.Width = 200;
                 btnAccept.Height = 32;
                 btnAccept.FlatStyle = FlatStyle.Flat;
-                btnAccept.BackColor = Color.FromArgb(52, 56, 62);
-                btnAccept.ForeColor = Color.Gainsboro;
+                btnAccept.BackColor = Theme.BgSurfaceAlt;
+                btnAccept.ForeColor = Theme.TextPrimary;
                 btnAccept.FlatAppearance.BorderColor = Color.FromArgb(70, 75, 82);
                 btnAccept.DialogResult = DialogResult.OK;
                 btnAccept.Location = new Point(12, 12);
@@ -200,8 +207,8 @@ namespace ThunderPanSync
                 btnQuit.Width = 110;
                 btnQuit.Height = 32;
                 btnQuit.FlatStyle = FlatStyle.Flat;
-                btnQuit.BackColor = Color.FromArgb(52, 56, 62);
-                btnQuit.ForeColor = Color.Gainsboro;
+                btnQuit.BackColor = Theme.BgSurfaceAlt;
+                btnQuit.ForeColor = Theme.TextPrimary;
                 btnQuit.FlatAppearance.BorderColor = Color.FromArgb(70, 75, 82);
                 btnQuit.DialogResult = DialogResult.Cancel;
                 btnQuit.Location = new Point(224, 12);
@@ -213,7 +220,7 @@ namespace ThunderPanSync
                 txt.ReadOnly = true;
                 txt.ScrollBars = ScrollBars.Vertical;
                 txt.WordWrap = true;
-                txt.BackColor = Color.FromArgb(22, 24, 28);
+                txt.BackColor = Theme.BgInset;
                 txt.ForeColor = Color.FromArgb(214, 220, 228);
                 txt.Font = new Font("Microsoft YaHei UI", 9.5F);
                 txt.BorderStyle = BorderStyle.None;
@@ -239,24 +246,27 @@ namespace ThunderPanSync
             Height = 720;
             MinimumSize = new Size(820, 600);
             StartPosition = FormStartPosition.CenterScreen;
-            BackColor = Color.FromArgb(38, 40, 44);
-            ForeColor = Color.Gainsboro;
+            BackColor = Theme.BgWindow;
+            ForeColor = Theme.TextPrimary;
+
+            // DarkForm 只自绘了顶部 TitleBarPx 那么高的标题栏，没有把内容区让出来。
+            // 所以这里给窗体加顶部 Padding，让所有 Dock=Top / Fill 的子控件都从标题栏下方开始。
+            // 这样做比"自己算每个控件的 Y 偏移"可靠得多：Dock 布局会自动遵守 Padding。
+            Padding = new Padding(0, TitleBarPx, 0, 0);
+            AutoScaleMode = AutoScaleMode.None;
 
             // --- 进度条（状态条下方）---
-            // WinForms 的 Dock 顺序是"后添加的更靠外"：Dock=Top 的控件，先加的在内侧。
-            // 所以进度面板必须在状态条**之前** Add，才会排在状态条下面而不是上面。
-            // （这两条都是实测出来的，不是猜的：写反了进度条会跑到窗口最顶端。）
             _progressPanel = new Panel();
             _progressPanel.Dock = DockStyle.Top;
             _progressPanel.Height = 40;
-            _progressPanel.BackColor = Color.FromArgb(26, 28, 32);
+            _progressPanel.BackColor = Theme.BgBar;
             _progressPanel.Padding = new Padding(12, 4, 12, 6);
             Controls.Add(_progressPanel);
 
             _lblProgress = new Label();
             _lblProgress.Dock = DockStyle.Fill;
             _lblProgress.Text = "空闲（同步时显示：第 x/y 个 · 文件名 · 速度 · 剩余）";
-            _lblProgress.ForeColor = Color.Gray;
+            _lblProgress.ForeColor = Theme.TextTertiary;
             _lblProgress.Font = new Font("Microsoft YaHei UI", 9F);
             _lblProgress.TextAlign = ContentAlignment.MiddleLeft;
             _progressPanel.Controls.Add(_lblProgress);
@@ -273,21 +283,21 @@ namespace ThunderPanSync
             _progressPanel.Controls.Add(_progress);
 
             // --- 状态条 ---
-            var status = new Panel();
-            status.Dock = DockStyle.Top;
-            status.Height = 44;
-            status.BackColor = Color.FromArgb(30, 32, 36);
-            status.Padding = new Padding(12, 8, 12, 8);
-            Controls.Add(status);
+            var statusBar = new Panel();
+            statusBar.Dock = DockStyle.Top;
+            statusBar.Height = 44;
+            statusBar.BackColor = Theme.BgBar;
+            statusBar.Padding = new Padding(12, 8, 12, 8);
+            Controls.Add(statusBar);
 
-            _lblState = MakeStatusLabel("● 启动中", Color.Gold);
-            _lblDirs = MakeStatusLabel("文件夹 0", Color.Gainsboro);
-            _lblUploaded = MakeStatusLabel("已上传 0", Color.LightGreen);
-            _lblFailed = MakeStatusLabel("失败 0", Color.Salmon);
-            _lblRemote = MakeStatusLabel("远程 待创建", Color.Gainsboro);
+            _lblState = MakeStatusLabel("● 启动中", Theme.Warn);
+            _lblDirs = MakeStatusLabel("文件夹 0", Theme.TextPrimary);
+            _lblUploaded = MakeStatusLabel("已上传 0", Theme.Ok);
+            _lblFailed = MakeStatusLabel("失败 0", Theme.Danger);
+            _lblRemote = MakeStatusLabel("远程 待创建", Theme.TextPrimary);
             // 协议错误可见计数：默认隐藏，非 0 才显示。
             // 之前 protocol-error 事件在 C# 端根本没有分支，协议坏了界面完全无感。
-            _lblProtocolErr = MakeStatusLabel("协议错误 0", Color.Orange);
+            _lblProtocolErr = MakeStatusLabel("协议错误 0", Theme.Warn);
             _lblProtocolErr.Visible = false;
 
             var flow = new FlowLayoutPanel();
@@ -306,22 +316,35 @@ namespace ThunderPanSync
             flow.Controls.Add(_lblRemote);
             flow.Controls.Add(Spacer(18));
             flow.Controls.Add(_lblProtocolErr);
-            status.Controls.Add(flow);
+            statusBar.Controls.Add(flow);
 
-            // --- 标签页 ---
-            _tabs = new TabControl();
-            _tabs.Dock = DockStyle.Fill;
-            Controls.Add(_tabs);
-            _tabs.BringToFront();
+            // --- 标签页（用自绘 SegmentedTabs + Panel，不用原生 TabControl）---
+            //
+            // 为什么不用 TabControl：它的页体背景由系统视觉样式绘制，永远是 #F0F0F0，
+            // TabPages[i].BackColor 设了也不生效（实测）。在深色窗口里那一大块白底
+            // 是"廉价感"的主要来源之一，而且无法通过任何属性消除。
+            // SegmentedTabs 是自绘的，配合普通 Panel 做页体，颜色完全可控。
+            _tabStrip = new SegmentedTabs();
+            _tabStrip.Tabs = new string[] { "备份", "设置" };
+            _tabStrip.Dock = DockStyle.Top;
+            _tabStrip.Height = Theme.S(36);
+            _tabStrip.SelectedIndexChanged += delegate { SwitchTab(); };
+            Controls.Add(_tabStrip);
+
+            _pageHost = new Panel();
+            _pageHost.Dock = DockStyle.Fill;
+            _pageHost.BackColor = Theme.BgSurface;
+            Controls.Add(_pageHost);
 
             BuildMainTab();
             BuildSettingsTab();
+            SwitchTab();
 
             // --- 底部按钮条 ---
             var bottom = new Panel();
             bottom.Dock = DockStyle.Bottom;
             bottom.Height = 52;
-            bottom.BackColor = Color.FromArgb(30, 32, 36);
+            bottom.BackColor = Theme.BgBar;
             bottom.Padding = new Padding(12, 10, 12, 10);
             Controls.Add(bottom);
 
@@ -341,6 +364,25 @@ namespace ThunderPanSync
             bflow.Controls.Add(_btnLogin);
             bflow.Controls.Add(_btnOpenLog);
             bottom.Controls.Add(bflow);
+
+            // ---------------- 显式固定 Z 序（不靠 Add 的顺序猜） ----------------
+            //
+            // WinForms 的 Dock 规则：**后添加到 Controls 集合的 Dock=Top 控件更靠外**。
+            // 也就是说 Add 顺序和"从上到下"的视觉顺序是**相反**的，这非常反直觉，
+            // 而且写错了不会报错，只表现为"控件跑到奇怪的位置 / 被遮住"。
+            //
+            // 实测踩过：原来的 Add 顺序让 _pageHost(Fill) 抢到了 Tab 上方的空间，
+            // 结果进度条跑到页面中部、日志区被挤没、状态胶囊看不见。
+            //
+            // 所以这里不再依赖 Add 顺序，直接用 SetChildIndex 把 Z 序钉死：
+            //   index 0           = 最内层（Fill，吃剩余空间）
+            //   越靠后的 index     = 越靠外（先被 Dock 摆到边缘）
+            // 视觉从上到下：statusBar → progress → tabStrip → pageHost → footer
+            Controls.SetChildIndex(_pageHost, 0);       // Fill 必须最先（最内层）
+            Controls.SetChildIndex(_tabStrip, 1);
+            Controls.SetChildIndex(_progressPanel, 2);
+            Controls.SetChildIndex(statusBar, 3);
+            Controls.SetChildIndex(bottom, 4);          // Bottom 最外
 
             _btnSync.Click += delegate { DoSync(); };
             _btnStart.Click += delegate { DoSimple("start", "自动备份已启动"); };
@@ -398,28 +440,40 @@ namespace ThunderPanSync
             };
         }
 
+        /// <summary>切换标签页：只改两个 Panel 的可见性，不重建控件（重建会丢状态）。</summary>
+        private void SwitchTab()
+        {
+            if (_pageMain == null || _pageSettings == null) return;
+            bool main = (_tabStrip.SelectedIndex == 0);
+            _pageMain.Visible = main;
+            _pageSettings.Visible = !main;
+            if (main) _pageMain.BringToFront(); else _pageSettings.BringToFront();
+        }
+
         private void BuildMainTab()
         {
-            var page = new TabPage("备份");
-            page.BackColor = Color.FromArgb(38, 40, 44);
-            _tabs.TabPages.Add(page);
+            _pageMain = new Panel();
+            _pageMain.Dock = DockStyle.Fill;
+            _pageMain.BackColor = Theme.BgSurface;
+            _pageHost.Controls.Add(_pageMain);
+            var page = _pageMain;
 
             // 文件夹列表
             var lbl = new Label();
             lbl.Text = "监视的文件夹（里面的文件会自动备份到迅雷云盘）：";
             lbl.Dock = DockStyle.Top;
             lbl.Height = 26;
-            lbl.ForeColor = Color.Gainsboro;
+            lbl.ForeColor = Theme.TextPrimary;
             page.Controls.Add(lbl);
 
-            _lvDirs = new ListView();
+            _lvDirs = new DarkListView();
             _lvDirs.Dock = DockStyle.Top;
             _lvDirs.Height = 150;
             _lvDirs.View = View.Details;
             _lvDirs.FullRowSelect = true;
-            _lvDirs.BackColor = Color.FromArgb(28, 30, 34);
-            _lvDirs.ForeColor = Color.Gainsboro;
+            _lvDirs.BackColor = Theme.BgSurfaceAlt;
             _lvDirs.Columns.Add("文件夹路径", 700);
+            _lvDirs.FitColumns();
             page.Controls.Add(_lvDirs);
 
             var dirBtns = new Panel();
@@ -443,7 +497,7 @@ namespace ThunderPanSync
             split.Dock = DockStyle.Fill;
             split.Orientation = Orientation.Horizontal;
             split.SplitterDistance = 260;
-            split.BackColor = Color.FromArgb(50, 54, 60);
+            split.BackColor = Theme.Border;
             page.Controls.Add(split);
 
             var logPanel = new Panel();
@@ -454,7 +508,7 @@ namespace ThunderPanSync
             lblLog.Text = "运行日志：";
             lblLog.Dock = DockStyle.Top;
             lblLog.Height = 24;
-            lblLog.ForeColor = Color.Gainsboro;
+            lblLog.ForeColor = Theme.TextPrimary;
             logPanel.Controls.Add(lblLog);
 
             _txtLog = new TextBox();
@@ -462,7 +516,7 @@ namespace ThunderPanSync
             _txtLog.Multiline = true;
             _txtLog.ReadOnly = true;
             _txtLog.ScrollBars = ScrollBars.Vertical;
-            _txtLog.BackColor = Color.FromArgb(22, 24, 28);
+            _txtLog.BackColor = Theme.BgInset;
             _txtLog.ForeColor = Color.FromArgb(180, 200, 220);
             _txtLog.Font = new Font("Consolas", 9F);
             _txtLog.BorderStyle = BorderStyle.None;
@@ -480,19 +534,20 @@ namespace ThunderPanSync
             lblFail.Text = "失败的文件（原因在这里，修好后点「立即同步一次」会重试）：";
             lblFail.Dock = DockStyle.Top;
             lblFail.Height = 24;
-            lblFail.ForeColor = Color.Gainsboro;
+            lblFail.ForeColor = Theme.TextPrimary;
             failPanel.Controls.Add(lblFail);
 
-            _lvFail = new ListView();
+            _lvFail = new DarkListView();
             _lvFail.Dock = DockStyle.Fill;
             _lvFail.View = View.Details;
             _lvFail.FullRowSelect = true;
             _lvFail.GridLines = false;
-            _lvFail.BackColor = Color.FromArgb(28, 30, 34);
-            _lvFail.ForeColor = Color.Gainsboro;
+            _lvFail.BackColor = Theme.BgSurfaceAlt;
+            _lvFail.ForeColor = Theme.TextPrimary;
             _lvFail.Columns.Add("文件", 240);
             _lvFail.Columns.Add("次数", 50);
             _lvFail.Columns.Add("原因", 420);
+            _lvFail.FitColumns();
             failPanel.Controls.Add(_lvFail);
             _lvFail.BringToFront();
             lblFail.BringToFront();
@@ -505,9 +560,12 @@ namespace ThunderPanSync
 
         private void BuildSettingsTab()
         {
-            var page = new TabPage("设置");
-            page.BackColor = Color.FromArgb(38, 40, 44);
-            _tabs.TabPages.Add(page);
+            _pageSettings = new Panel();
+            _pageSettings.Dock = DockStyle.Fill;
+            _pageSettings.BackColor = Theme.BgSurface;
+            _pageSettings.AutoScroll = true;
+            _pageHost.Controls.Add(_pageSettings);
+            var page = _pageSettings;
 
             var y = 20;
             page.Controls.Add(MakeLabel("远程文件夹名（云盘里的目录名）：", 20, y)); y += 24;
@@ -526,7 +584,7 @@ namespace ThunderPanSync
             _chkAutoStart.Text = "开机时自动启动";
             _chkAutoStart.Location = new Point(20, y);
             _chkAutoStart.Width = 300;
-            _chkAutoStart.ForeColor = Color.Gainsboro;
+            _chkAutoStart.ForeColor = Theme.TextPrimary;
             page.Controls.Add(_chkAutoStart); y += 40;
 
             _btnSave = MakeButton("保存设置", 120);
@@ -536,7 +594,7 @@ namespace ThunderPanSync
 
             var hint = MakeLabel("备份不会删除本地文件。日志与配置存放在：" + _dataDir, 20, y + 50);
             hint.Width = 900;
-            hint.ForeColor = Color.Gray;
+            hint.ForeColor = Theme.TextTertiary;
             page.Controls.Add(hint);
         }
 
@@ -565,8 +623,8 @@ namespace ThunderPanSync
             b.Width = w;
             b.Height = 30;
             b.FlatStyle = FlatStyle.Flat;
-            b.BackColor = Color.FromArgb(52, 56, 62);
-            b.ForeColor = Color.Gainsboro;
+            b.BackColor = Theme.BgSurfaceAlt;
+            b.ForeColor = Theme.TextPrimary;
             b.FlatAppearance.BorderColor = Color.FromArgb(70, 75, 82);
             b.Margin = new Padding(0, 0, 8, 0);
             return b;
@@ -577,7 +635,7 @@ namespace ThunderPanSync
             l.Text = text;
             l.Location = new Point(x, y);
             l.AutoSize = true;
-            l.ForeColor = Color.Gainsboro;
+            l.ForeColor = Theme.TextPrimary;
             return l;
         }
         private TextBox MakeInput(int x, int y, int w)
@@ -585,8 +643,8 @@ namespace ThunderPanSync
             var t = new TextBox();
             t.Location = new Point(x, y);
             t.Width = w;
-            t.BackColor = Color.FromArgb(28, 30, 34);
-            t.ForeColor = Color.Gainsboro;
+            t.BackColor = Theme.BgSurfaceAlt;
+            t.ForeColor = Theme.TextPrimary;
             t.BorderStyle = BorderStyle.FixedSingle;
             return t;
         }
@@ -628,7 +686,7 @@ namespace ThunderPanSync
                         UiInvoke(delegate
                         {
                             _lblState.Text = "● 引擎启动较慢，仍在等…";
-                            _lblState.ForeColor = Color.Gold;
+                            _lblState.ForeColor = Theme.Warn;
                             SetProgressIdle("引擎启动较慢（机器繁忙时正常），请稍候…");
                         });
                     }
@@ -752,13 +810,13 @@ namespace ThunderPanSync
             if (_loggedIn)
             {
                 _btnLogin.Text = "已登录 ✓";
-                _btnLogin.BackColor = Color.FromArgb(52, 56, 62);
+                _btnLogin.BackColor = Theme.BgSurfaceAlt;
                 _btnLogin.Enabled = true;   // 仍可点击（重新登录）
             }
             else
             {
                 _btnLogin.Text = "需要登录迅雷云盘";
-                _btnLogin.BackColor = Color.FromArgb(180, 120, 30);
+                _btnLogin.BackColor = Theme.Warn;
             }
         }
 
@@ -832,18 +890,18 @@ namespace ThunderPanSync
                 else if (up == 0)
                 {
                     _lblProgress.Text = "本轮失败 " + bad + " 个文件（详见下方失败列表）";
-                    _lblProgress.ForeColor = Color.Salmon;
+                    _lblProgress.ForeColor = Theme.Danger;
                 }
                 else
                 {
                     _lblProgress.Text = "部分成功 · 成功 " + up + "，失败 " + bad
                         + "（详见下方失败列表）";
-                    _lblProgress.ForeColor = Color.Gold;
+                    _lblProgress.ForeColor = Theme.Warn;
                 }
                 if (bad == 0)
                 {
                     try { _progress.Value = 1000; } catch { }
-                    _lblProgress.ForeColor = Color.LightGreen;
+                    _lblProgress.ForeColor = Theme.Ok;
                 }
                 else if (bad < 0)
                 {
@@ -857,7 +915,7 @@ namespace ThunderPanSync
                     try { _progress.Value = Math.Min(_progress.Maximum, 999); } catch { }
                     try
                     {
-                        _progress.ForeColor = Color.Salmon;
+                        _progress.ForeColor = Theme.Danger;
                     }
                     catch { }
                 }
@@ -866,7 +924,7 @@ namespace ThunderPanSync
             if (phase == "scanning")
             {
                 _progress.Value = 0;
-                _lblProgress.ForeColor = Color.Gainsboro;
+                _lblProgress.ForeColor = Theme.TextPrimary;
                 _lblProgress.Text = "正在扫描…" + (total > 0 ? ("（" + total + " 个文件）") : "");
                 return;
             }
@@ -916,7 +974,7 @@ namespace ThunderPanSync
                 sb.Append(FormatEta(etaMs));
             }
 
-            _lblProgress.ForeColor = Color.Gainsboro;
+            _lblProgress.ForeColor = Theme.TextPrimary;
             _lblProgress.Text = sb.ToString();
         }
 
@@ -930,7 +988,7 @@ namespace ThunderPanSync
                 // 否则会出现"进度满格→归零→灰色中性文本"的成功错觉（实测复现过）。
                 bool looksLikeFailure = !string.IsNullOrEmpty(text)
                     && (text.IndexOf("失败") >= 0 || text.IndexOf("未完成") >= 0);
-                if (!looksLikeFailure) _lblProgress.ForeColor = Color.Gray;
+                if (!looksLikeFailure) _lblProgress.ForeColor = Theme.TextTertiary;
                 _lblProgress.Text = string.IsNullOrEmpty(text) ? "空闲" : text;
             }
         }
@@ -954,6 +1012,18 @@ namespace ThunderPanSync
 
         private void UiFatal(string msg)
         {
+            // 诊断：把"谁判了致命错误 + 调用栈"写进 ui-fatal.log。
+            // 没有这个，界面上那句"引擎异常"永远查不出是谁设的
+            // （实测遇到过：界面显示异常、引擎 log 却一片正常）。
+            try
+            {
+                var sb = new StringBuilder();
+                sb.AppendLine("[" + DateTime.Now.ToString("HH:mm:ss.fff") + "] UiFatal: " + msg);
+                sb.AppendLine(Environment.StackTrace);
+                File.AppendAllText(Path.Combine(_dataDir, "ui-fatal.log"), sb.ToString());
+            }
+            catch (Exception) { }
+
             // 错误提示必须带引擎自己的话（stderr 尾部）。只显示"引擎进程已退出"
             // 等于什么都没说，用户和我们都无从查起。
             string detail = msg;
@@ -961,7 +1031,7 @@ namespace ThunderPanSync
             UiInvoke(delegate
             {
                 _lblState.Text = "● 引擎异常";
-                _lblState.ForeColor = Color.Salmon;
+                _lblState.ForeColor = Theme.Danger;
                 AppendLog("[错误] " + detail);
                 SetProgressIdle("已停止（引擎异常）");
             });
@@ -1090,23 +1160,23 @@ namespace ThunderPanSync
                     {
                         _lblState.Text = "● 已暂停（连续失败 " + consecFail
                             + " 轮，点「立即同步」重试）";
-                        _lblState.ForeColor = Color.Salmon;
+                        _lblState.ForeColor = Theme.Danger;
                     }
                     else if (running)
                     {
                         _lblState.Text = "● 备份中";
-                        _lblState.ForeColor = Color.LightGreen;
+                        _lblState.ForeColor = Theme.Ok;
                     }
                     else if (hasDirs)
                     {
                         // 用户已经有目录却不跑了：必须明确告诉他"现在没在备份"
                         _lblState.Text = "● 未在备份（点「开始自动备份」）";
-                        _lblState.ForeColor = Color.Salmon;
+                        _lblState.ForeColor = Theme.Danger;
                     }
                     else
                     {
                         _lblState.Text = "● 尚未配置（请添加文件夹）";
-                        _lblState.ForeColor = Color.Gold;
+                        _lblState.ForeColor = Theme.Warn;
                     }
 
                     int total = 0;

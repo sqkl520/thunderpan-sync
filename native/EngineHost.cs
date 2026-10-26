@@ -35,6 +35,12 @@ namespace ThunderPanSync
         // "已停止（引擎异常）"，两条互相矛盾，而且那句告警是假的。
         private volatile bool _closing = false;
 
+        // 引擎进程是否已经"启动完成且 stdin 可用"。
+        // Call() 用它区分两种情况：
+        //   false => 还没启动完，写不进去是正常的（返回 null，不报警）
+        //   true  => 已在运行，此时写失败大概率是进程中途死了（才报异常）
+        private volatile bool _started = false;
+
         // stderr 落盘：debug 级别的引擎原始日志不进 UI（会刷屏），但绝不能丢——
         // 崩溃时的最后几行几乎总是唯一线索。OnFatal 时把末尾若干行附在错误里。
         private readonly object _stderrSync = new object();
@@ -78,6 +84,10 @@ namespace ThunderPanSync
             _closing = false;
             _ready = false;
             _proc.Start();
+            // 进程起来了、stdio 重定向就绪，标记为可通信。
+            // 放在 Start() 之后、读线程启动之前：读线程是先 Start 的，
+            // 但它在收到 ready 之前不会让 IsReady 为真，所以这里顺序是安全的。
+            _started = true;
 
             var tOut = new Thread(ReadStdout);
             tOut.IsBackground = true;
@@ -334,6 +344,17 @@ namespace ThunderPanSync
         /// <summary>同步调用一条命令，返回原始 JSON 响应行（超时返回 null）。</summary>
         public string Call(string cmd, Dictionary<string, object> prms, int timeoutMs)
         {
+            // 引擎还没启动完（或已关闭）时，"写不进去"不是异常，只是"现在没人可问"。
+            //
+            // 实测踩到的真 bug：StartEngine 在后台线程里跑，而 RefreshStatus 可能在它
+            // 完成之前就被触发，此时 _proc 的 StandardInput 还没重定向好，
+            // WriteLine 抛 "StandardIn 尚未重定向"，被当成致命错误 ——
+            // 界面上永久显示"● 引擎异常 / 已停止（引擎异常）"，
+            // 而实际上引擎几秒后就正常就绪了。日志里 engine-stderr 一片空白，
+            // 完全看不出问题在哪（最后靠写调用栈到 ui-fatal.log 才定位到）。
+            if (_proc == null || !_proc.StartInfo.RedirectStandardInput || !_started)
+                return null;
+
             int id;
             var ev = new ManualResetEventSlim(false);
             lock (_sync)
@@ -355,7 +376,8 @@ namespace ThunderPanSync
             catch (Exception ex)
             {
                 lock (_sync) { _waiters.Remove(id); }
-                RaiseFatal("写入引擎失败: " + ex.Message);
+                // 只有"已经在正常运行之后写失败"才可能是真异常（进程中途死掉）。
+                if (_started) RaiseFatal("写入引擎失败: " + ex.Message);
                 return null;
             }
 
@@ -394,6 +416,8 @@ namespace ThunderPanSync
             // 必须先置位再发 quit：读线程可能在 quit 之后立刻看到 EOF，
             // 晚一步就会先抛出"引擎进程已退出"再被这里覆盖，信号已经发给 UI 了。
             _closing = true;
+            // 主动关闭后不再接受 Call()：此后写 stdin 失败是预期行为，不该报警。
+            _started = false;
             try
             {
                 if (_proc != null && !_proc.HasExited)

@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  app.manifest — 高 DPI 与系统版本声明
+
+  为什么必须有这个文件：
+
+  1) DPI 感知
+     不声明 dpiAware 时，Windows 会把程序当成 DPI 不感知，在 125%/150% 缩放下
+     由系统做位图拉伸，界面整体糊掉。用户屏幕是 2560x1440，几乎必然不是 100%。
+
+  2) supportedOS 声明（这一条极其隐蔽）
+     不声明 Windows 10 的 GUID 时，.NET Framework 会把 Environment.OSVersion
+     降级报告成 6.2.9200（Windows 8），实测确认：
+         Environment.OSVersion.Version.Major == 6   (实际是 10.0.19045)
+     任何 "if (Major < 10)" 的系统能力判断都会因此短路返回。
+     所以代码里另有一道保险：Drawing.WindowsBuild 用 RtlGetVersion 直读。
+
+  ============================================================
+  踩过的坑（改动本文件前必读）
+  ============================================================
+
+  【坑 1】XML 注释里不能出现两个连续的短横线。
+  这个规范细节会让人栽跟头，因为写注释时顺手用短横线做分隔非常自然。
+  曾经本文件的注释第一行写成 "app.manifest 后接两个短横线 后接 高 DPI 声明"，
+  结果整个清单变成非法 XML，csc 编译**照样成功**（它不校验清单），
+  但运行 exe 时直接报：
+      "The application has failed to start because its side-by-side
+       configuration is incorrect."
+  程序连进程都起不来。用 sxstrace 定位不了（需要管理员权限），
+  最后靠 [xml] 强转类型才暴露出 "An XML comment cannot contain" 这条错误。
+  教训：改完 manifest 必须用 [xml] 校验一次，并且实际运行 exe。
+
+  【坑 2】不要加 activeCodePage / dpiAwareness 这类较新的命名空间扩展。
+  它们要求目标 Windows 版本与 SxS 清单版本匹配，任一不满足会让
+  **整个清单校验失败**（不是忽略那一项，是整份失效）。
+  只放"最小、最老、最广泛支持"的声明就够了。
+-->
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity version="1.0.0.0" name="ThunderPanSync.app" />
+
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+    <security>
+      <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
+        <!-- 普通用户权限即可；不要求管理员，避免每次启动弹 UAC -->
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 / 11。GUID 必须精确，写错会让清单校验失败 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+      <!-- Windows 8.1 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}" />
+      <!-- Windows 8 -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}" />
+      <!-- Windows 7 -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}" />
+    </application>
+  </compatibility>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!--
+        dpiAware 用最老最稳的写法（SMI/2005 命名空间，Vista 起就支持）。
+        true/pm 表示程序自己处理 DPI 缩放（我们在 Theme.S() 里做）。
+
+        这里故意不用 dpiAwareness PerMonitorV2（SMI/2016 命名空间）：
+        那个是 Win10 1607+ 才认，为不给清单增加失败面，统一走老写法。
+        单显示器缩放下两者行为一致。
+      -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+    </windowsSettings>
+  </application>
+</assembly>
