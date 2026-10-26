@@ -31,20 +31,56 @@ namespace ThunderPanSync
         // 控件
         // 标签页用自绘 SegmentedTabs + 两个 Panel，不用原生 TabControl
         // （原生 TabControl 的页体背景永远是浅色 #F0F0F0，无法改，见 BuildUi 里的说明）
+        // 标签页用自绘 SegmentedTabs + 两个 Panel，不用原生 TabControl
+        // （原生 TabControl 的页体背景永远是浅色 #F0F0F0，无法改）
         private SegmentedTabs _tabStrip;
         private Panel _pageHost, _pageMain, _pageSettings;
         private DarkListView _lvDirs;
         private Button _btnAddDir, _btnDelDir;
         private TextBox _txtLog;
         private DarkListView _lvFail;
-        private Button _btnSync, _btnStart, _btnStop, _btnSave, _btnOpenLog, _btnLogin;
-        private TextBox _txtRemoteName, _txtInterval, _txtSettle, _txtMaxSize;
+        private Button _btnSync, _btnStart, _btnStop, _btnSave, _btnOpenLog;
+        // 设置页（DECISIONS §3.6）：只有"云盘目录名"还是文本框，其余三项改 ComboBox ——
+        // 用文本框让用户手输"多久找一次"既容易输错，也无法表达推荐值。
+        private TextBox _txtRemoteName;
+        private FlatCombo _cboInterval, _cboSettle, _cboMaxSize;
         private CheckBox _chkAutoStart;
-        private Label _lblState, _lblDirs, _lblUploaded, _lblFailed, _lblRemote;
-        // 进度区（状态条下方）：ProgressBar + "第 x/y · 文件名 · 速度 · 剩余"
-        private ProgressBar _progress;
-        private Label _lblProgress, _lblProtocolErr;
-        private Panel _progressPanel;
+        // 状态条（DECISIONS §3.5）：TableLayoutPanel + 定宽列。实测 FlowLayoutPanel 在
+        // 同一组文本下抖动 156px，绝对坐标重叠 38px，只有表格稳定。
+        private Panel _statusBar, _honestyBar, _progressRow, _footer;
+        private TableLayoutPanel _statusGrid;
+        private StatusPill _pill;
+        private StatChip _chipDirs, _chipUploaded, _chipFailed, _chipLogin;
+        private Label _lblProtocolErr, _lblHonesty, _lblHonestyTail, _lblProgress;
+        private FlatProgress _flatProgress;
+        private Panel _failPanel;
+        private Label _lblFail, _lblFailSummary;
+        // ---- 唯一状态机（DECISIONS §五 A-1）----
+        // 界面状态只有一个来源：RefreshUiState()。任何地方都不许直接改 _pill 的文字，
+        // 否则"熔断显示绿色"这类说谎缺陷会以另一种形式复发。
+        private UiState _uiState = UiState.Ready;
+        // 只有 UiFatal 能置 true —— 启动期慢绝不等于异常（历史假告警就是从这里来的）
+        private bool _engineFatal = false;
+        // 只有 StartEngine 成功等到 ready 后才能置 true：它是 Error 态的唯一闸门
+        private volatile bool _engineReady = false;
+        // 只有 progress 的 done 分支能写；OnRunComplete 必须尊重它（A-2 的覆盖 bug）
+        private string _lastRoundFatalCode = null;
+        private DateTime _lastStatusAt = DateTime.MinValue;
+        // A-4：1 秒 Timer 驱动秒表/相对时间/状态过期；10 秒 Timer 轮询 status
+        private System.Windows.Forms.Timer _tickTimer, _pollTimer;
+        // 本轮开始时间（秒表用）；_roundActive 为 false 时不显示"已用"
+        private DateTime _roundStartedAt = DateTime.MinValue;
+        private bool _roundActive = false;
+        // 失败列表内容签名（A-5：只比数量会在"修好 A、坏掉 B"时不刷新）
+        private string _failSig = "";
+        // ---- 状态机附属字段 ----
+        private bool _haveStatus = false;
+        private bool _stRunning = false;
+        private bool _stCircuitOpen = false;
+        private int _stDirsCount = 0;
+        private int _stConsecFail = 0;
+        private int _stUploadedTotal = 0;
+        private int _stFailedTotal = 0;
         private NotifyIcon _tray;
         private bool _reallyQuit = false;
         private volatile bool _loggedIn = false;
@@ -172,9 +208,9 @@ namespace ThunderPanSync
             using (var f = new Form())
             {
                 f.Text = "ThunderPanSync · 首次使用须知（请务必阅读）";
-                f.Width = 760;
-                f.Height = 620;
-                f.MinimumSize = new Size(600, 480);
+                f.Width = Theme.S(760);
+                f.Height = Theme.S(620);
+                f.MinimumSize = new Size(Theme.S(600), Theme.S(480));
                 f.StartPosition = FormStartPosition.CenterScreen;
                 f.BackColor = Theme.BgSurface;
                 f.ForeColor = Theme.TextPrimary;
@@ -185,33 +221,34 @@ namespace ThunderPanSync
 
                 var bottom = new Panel();
                 bottom.Dock = DockStyle.Bottom;
-                bottom.Height = 56;
+                bottom.Height = Theme.S(56);
                 bottom.BackColor = Theme.BgBar;
-                bottom.Padding = new Padding(12, 12, 12, 12);
+                // EULA 底栏 padY 10：内容 36 >= 原生 Button 32（ADDENDUM 第 5 条）
+                bottom.Padding = new Padding(Theme.S(12), Theme.S(10), Theme.S(12), Theme.S(10));
                 f.Controls.Add(bottom);
 
                 var btnAccept = new Button();
                 btnAccept.Text = "我已了解并承担风险";
-                btnAccept.Width = 200;
-                btnAccept.Height = 32;
+                btnAccept.Width = Theme.S(200);
+                btnAccept.Height = Theme.S(32);
                 btnAccept.FlatStyle = FlatStyle.Flat;
                 btnAccept.BackColor = Theme.BgSurfaceAlt;
                 btnAccept.ForeColor = Theme.TextPrimary;
                 btnAccept.FlatAppearance.BorderColor = Color.FromArgb(70, 75, 82);
                 btnAccept.DialogResult = DialogResult.OK;
-                btnAccept.Location = new Point(12, 12);
+                btnAccept.Location = new Point(Theme.S(12), Theme.S(10));
                 bottom.Controls.Add(btnAccept);
 
                 var btnQuit = new Button();
                 btnQuit.Text = "退出";
-                btnQuit.Width = 110;
-                btnQuit.Height = 32;
+                btnQuit.Width = Theme.S(110);
+                btnQuit.Height = Theme.S(32);
                 btnQuit.FlatStyle = FlatStyle.Flat;
                 btnQuit.BackColor = Theme.BgSurfaceAlt;
                 btnQuit.ForeColor = Theme.TextPrimary;
                 btnQuit.FlatAppearance.BorderColor = Color.FromArgb(70, 75, 82);
                 btnQuit.DialogResult = DialogResult.Cancel;
-                btnQuit.Location = new Point(224, 12);
+                btnQuit.Location = new Point(Theme.S(224), Theme.S(10));
                 bottom.Controls.Add(btnQuit);
 
                 var txt = new TextBox();
@@ -239,96 +276,251 @@ namespace ThunderPanSync
         }
 
         // ---------------- UI 构建 ----------------
+        //
+        // 五条栏的最终像素（DECISIONS §3.2 + AGENT-A-ADDENDUM）：
+        //   标题栏 34（DarkForm 自绘） / 状态条 48 / 诚实性常驻条 24 / 进度行 36 /
+        //   标签条 36 / 页体 Fill / 底栏 52
+        // 全部走 Theme.S()：窗口在 150% 下放大 1.5 倍，栏高不跟着放大就会把文字裁掉。
         private void BuildUi()
         {
             Text = "ThunderPanSync · 迅雷云盘自动备份";
-            Width = 1000;
-            Height = 720;
-            MinimumSize = new Size(820, 600);
+            // DarkForm 的隐形边框吃 14px（7px/边）⇒ 1000×760 的客户区是 986×746。
+            Width = Theme.S(1000);
+            Height = Theme.S(760);
+            MinimumSize = new Size(Theme.S(940), Theme.S(700));
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Theme.BgWindow;
             ForeColor = Theme.TextPrimary;
 
-            // DarkForm 只自绘了顶部 TitleBarPx 那么高的标题栏，没有把内容区让出来。
-            // 所以这里给窗体加顶部 Padding，让所有 Dock=Top / Fill 的子控件都从标题栏下方开始。
-            // 这样做比"自己算每个控件的 Y 偏移"可靠得多：Dock 布局会自动遵守 Padding。
+            // DarkForm 只自绘了顶部 TitleBarPx 高的标题栏，内容区要自己让出来。
+            // 用 Padding 而不是逐个控件算 Y 偏移：Dock 布局会自动遵守它。
             Padding = new Padding(0, TitleBarPx, 0, 0);
             AutoScaleMode = AutoScaleMode.None;
 
-            // --- 进度条（状态条下方）---
-            _progressPanel = new Panel();
-            _progressPanel.Dock = DockStyle.Top;
-            _progressPanel.Height = 40;
-            _progressPanel.BackColor = Theme.BgBar;
-            _progressPanel.Padding = new Padding(12, 4, 12, 6);
-            Controls.Add(_progressPanel);
+            BuildStatusBar();
+            BuildHonestyBar();
+            BuildProgressRow();
+            BuildTabsAndPages();
+            BuildFooter();
 
-            _lblProgress = new Label();
-            _lblProgress.Dock = DockStyle.Fill;
-            _lblProgress.Text = "空闲（同步时显示：第 x/y 个 · 文件名 · 速度 · 剩余）";
-            _lblProgress.ForeColor = Theme.TextTertiary;
-            _lblProgress.Font = new Font("Microsoft YaHei UI", 9F);
-            _lblProgress.TextAlign = ContentAlignment.MiddleLeft;
-            _progressPanel.Controls.Add(_lblProgress);
+            // ---- 显式钉 Z 序（不靠 Add 顺序猜）----
+            // WinForms 的 Dock 从 Controls.Count-1 往 0 处理：索引越大越靠外缘，
+            // 所以 Dock=Fill 必须占索引 0。Add 顺序写错了不报错，只表现为控件跑到
+            // 奇怪的位置或被遮住（实测踩过：Fill 抢了 Tab 上方的空间）。
+            // 禁止前台置顶调用 —— 对 Dock=Top 控件实测是"往下推"，净零/有害。
+            Controls.SetChildIndex(_pageHost, 0);
+            Controls.SetChildIndex(_tabStrip, 1);
+            Controls.SetChildIndex(_progressRow, 2);
+            Controls.SetChildIndex(_honestyBar, 3);
+            Controls.SetChildIndex(_statusBar, 4);
+            Controls.SetChildIndex(_footer, 5);
 
-            _progress = new ProgressBar();
-            _progress.Dock = DockStyle.Bottom;
-            _progress.Height = 10;
-            _progress.Minimum = 0;
-            _progress.Maximum = 1000;
-            _progress.Value = 0;
-            _progress.Style = ProgressBarStyle.Continuous;
-            // 必须在 Label(Fill) 之后添加：Fill 先占位，Bottom 才缩到 10px；
-            // 反过来 Bottom 先占位、Fill 后撑满会压住进度条（实测重叠）。
-            _progressPanel.Controls.Add(_progress);
+            _btnSync.Click += delegate { DoPrimary(); };
+            _btnStart.Click += delegate { DoSimple("start", "自动备份已启动"); };
+            _btnStop.Click += delegate { DoSimple("stop", "自动备份已停止"); };
+            _btnOpenLog.Click += delegate { OpenLogFile(); };
 
-            // --- 状态条 ---
-            var statusBar = new Panel();
-            statusBar.Dock = DockStyle.Top;
-            statusBar.Height = 44;
-            statusBar.BackColor = Theme.BgBar;
-            statusBar.Padding = new Padding(12, 8, 12, 8);
-            Controls.Add(statusBar);
+            BuildTray();
+            WireFormEvents();
+            StartTimers();
+            RefreshUiState();
+        }
 
-            _lblState = MakeStatusLabel("● 启动中", Theme.Warn);
-            _lblDirs = MakeStatusLabel("文件夹 0", Theme.TextPrimary);
-            _lblUploaded = MakeStatusLabel("已上传 0", Theme.Ok);
-            _lblFailed = MakeStatusLabel("失败 0", Theme.Danger);
-            _lblRemote = MakeStatusLabel("远程 待创建", Theme.TextPrimary);
-            // 协议错误可见计数：默认隐藏，非 0 才显示。
-            // 之前 protocol-error 事件在 C# 端根本没有分支，协议坏了界面完全无感。
-            _lblProtocolErr = MakeStatusLabel("协议错误 0", Theme.Warn);
+        /// <summary>状态条：TableLayoutPanel（五列定宽）+ 内嵌在底部的 8px 进度条。</summary>
+        private void BuildStatusBar()
+        {
+            _statusBar = new Panel();
+            _statusBar.Dock = DockStyle.Top;
+            _statusBar.Height = Theme.S(48);
+            _statusBar.BackColor = Theme.BgBar;
+            // 48 必须同时装下"pill/chip 上排"和"8px 进度条"（DECISIONS §3.4 要求内嵌）。
+            // 上排真实需要 = StatusPill 26 + margin 4 = 30，进度条 8 ⇒ 38；
+            // 若按 ADDENDUM 给 (8,8) 垂直内边距，内容只剩 32 < 38，上排就被裁 6px。
+            // 所以垂直内边距取 (2,0)：内容 46 ≥ 38，两档 DPI 都过。
+            _statusBar.Padding = new Padding(Theme.S(12), Theme.S(2), Theme.S(12), 0);
+            Controls.Add(_statusBar);
+
+            _statusGrid = new TableLayoutPanel();
+            _statusGrid.Dock = DockStyle.Fill;
+            _statusGrid.BackColor = Theme.BgBar;
+            _statusGrid.ColumnCount = 5;
+            _statusGrid.RowCount = 1;
+            // 有滚动条就吃掉 17px 高度（DPI Agent 实测）——状态条绝不允许出现滚动条
+            _statusGrid.AutoScroll = false;
+            _statusGrid.Margin = new Padding(0);
+            _statusGrid.Padding = new Padding(0);
+            _statusGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(280)));
+            _statusGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(150)));
+            _statusGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(150)));
+            _statusGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(110)));
+            _statusGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            _statusGrid.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            // 先加表格（Fill，索引 0）再加进度条（Bottom，索引 1）：
+            // 同一容器内也是索引大的先被 Dock 处理，Bottom 必须先占位，否则被 Fill 覆盖。
+            _statusBar.Controls.Add(_statusGrid);
+
+            _pill = new StatusPill();
+            _pill.Anchor = AnchorStyles.Left;
+            _pill.Margin = new Padding(0, 0, Theme.S(8), 0);
+            _pill.PinnedWidth = Theme.S(272);   // B 的控件自约束：Fit() 不再改写宽度（150% 下更稳）
+            _pill.PillState = StatusPill.PillKind.Unknown;
+            _pill.Text = "启动中";
+            _statusGrid.Controls.Add(_pill, 0, 0);
+
+            _chipDirs = new StatChip();
+            _chipDirs.Label = "文件夹";
+            _chipDirs.Value = "0";
+            _chipDirs.Anchor = AnchorStyles.Left;
+            _chipDirs.Margin = new Padding(0, 0, Theme.S(8), 0);
+            _chipDirs.PinnedWidth = Theme.S(142);
+            _statusGrid.Controls.Add(_chipDirs, 1, 0);
+
+            _chipUploaded = new StatChip();
+            _chipUploaded.Label = "已上传";
+            _chipUploaded.Value = "0";
+            _chipUploaded.ValueColor = Theme.Ok;
+            _chipUploaded.Anchor = AnchorStyles.Left;
+            _chipUploaded.Margin = new Padding(0, 0, Theme.S(8), 0);
+            _chipUploaded.PinnedWidth = Theme.S(142);
+            _statusGrid.Controls.Add(_chipUploaded, 2, 0);
+
+            _chipFailed = new StatChip();
+            _chipFailed.Label = "失败";
+            _chipFailed.Value = "0";
+            _chipFailed.ValueColor = Theme.Danger;
+            _chipFailed.Anchor = AnchorStyles.Left;
+            _chipFailed.Margin = new Padding(0, 0, Theme.S(8), 0);
+            _chipFailed.PinnedWidth = Theme.S(102);
+            _statusGrid.Controls.Add(_chipFailed, 3, 0);
+
+            // 「已登录」降级为状态信息，不再是一个常驻按钮（DECISIONS §3.8）
+            var right = new FlowLayoutPanel();
+            right.Dock = DockStyle.Fill;
+            right.FlowDirection = FlowDirection.LeftToRight;
+            right.WrapContents = false;
+            right.AutoScroll = false;
+            right.Margin = new Padding(0);
+            right.BackColor = Theme.BgBar;
+            _statusGrid.Controls.Add(right, 4, 0);
+
+            _chipLogin = new StatChip();
+            _chipLogin.Label = "登录";
+            _chipLogin.Value = "未登录";
+            _chipLogin.ValueColor = Theme.Warn;
+            _chipLogin.Margin = new Padding(0, 0, Theme.S(12), 0);
+            _chipLogin.PinnedWidth = Theme.S(130);
+            right.Controls.Add(_chipLogin);
+
+            // 协议错误可见计数：默认隐藏，非 0 才显示。之前协议坏了界面完全无感。
+            _lblProtocolErr = new Label();
+            _lblProtocolErr.Text = "协议错误 0";
+            _lblProtocolErr.AutoSize = true;
+            _lblProtocolErr.ForeColor = Theme.Warn;
+            _lblProtocolErr.Margin = new Padding(0, Theme.S(6), 0, 0);
             _lblProtocolErr.Visible = false;
+            // 无障碍（必修 2）：自绘控件拿得到焦点但不画焦点框，键盘 Tab 会停在
+            // "看不见的落点"上。这里把它们移出 Tab 序列：用户只在 FlatButton /
+            // TextBox / ComboBox 之间移动，每个都有可见焦点。标签条用方向键切换。
+            _pill.TabStop = false;
+            _chipDirs.TabStop = false;
+            _chipUploaded.TabStop = false;
+            _chipFailed.TabStop = false;
+            _chipLogin.TabStop = false;
+            right.Controls.Add(_lblProtocolErr);
+
+            _flatProgress = new FlatProgress();
+            _flatProgress.Dock = DockStyle.Bottom;
+            _flatProgress.Height = Theme.S(8);
+            _flatProgress.Ratio = 0;
+            // 换掉原生 ProgressBar 会丢语义，这里补上可访问性（屏幕阅读器要读得到）
+            _flatProgress.AccessibleRole = AccessibleRole.ProgressBar;
+            _flatProgress.AccessibleName = "本轮备份进度";
+            _statusBar.Controls.Add(_flatProgress);
+        }
+
+        /// <summary>诚实性常驻条（A-7）：只上传、不能下载或恢复 —— 常驻、不可关闭。</summary>
+        private void BuildHonestyBar()
+        {
+            _honestyBar = new Panel();
+            _honestyBar.Dock = DockStyle.Top;
+            _honestyBar.Height = Theme.S(24);
+            _honestyBar.BackColor = Theme.BgBar;
+            _honestyBar.Padding = new Padding(Theme.S(12), 0, Theme.S(12), 0);
+            Controls.Add(_honestyBar);
 
             var flow = new FlowLayoutPanel();
             flow.Dock = DockStyle.Fill;
             flow.FlowDirection = FlowDirection.LeftToRight;
             flow.WrapContents = false;
-            flow.AutoScroll = true;
-            flow.Controls.Add(_lblState);
-            flow.Controls.Add(Spacer(18));
-            flow.Controls.Add(_lblDirs);
-            flow.Controls.Add(Spacer(18));
-            flow.Controls.Add(_lblUploaded);
-            flow.Controls.Add(Spacer(18));
-            flow.Controls.Add(_lblFailed);
-            flow.Controls.Add(Spacer(18));
-            flow.Controls.Add(_lblRemote);
-            flow.Controls.Add(Spacer(18));
-            flow.Controls.Add(_lblProtocolErr);
-            statusBar.Controls.Add(flow);
+            flow.AutoScroll = false;
+            flow.Margin = new Padding(0);
+            flow.BackColor = Theme.BgBar;
+            _honestyBar.Controls.Add(flow);
 
-            // --- 标签页（用自绘 SegmentedTabs + Panel，不用原生 TabControl）---
-            //
-            // 为什么不用 TabControl：它的页体背景由系统视觉样式绘制，永远是 #F0F0F0，
-            // TabPages[i].BackColor 设了也不生效（实测）。在深色窗口里那一大块白底
-            // 是"廉价感"的主要来源之一，而且无法通过任何属性消除。
-            // SegmentedTabs 是自绘的，配合普通 Panel 做页体，颜色完全可控。
+            _lblHonesty = new Label();
+            _lblHonesty.Text = "只上传，不能下载或恢复";
+            _lblHonesty.AutoSize = true;
+            _lblHonesty.Font = new Font("Microsoft YaHei UI", 9F);
+            // 关键短语用 Warn：BgBar #1C1F24 上实测 8.39:1，过 AA
+            _lblHonesty.ForeColor = Theme.Warn;
+            _lblHonesty.Margin = new Padding(0, Theme.S(3), 0, 0);
+            flow.Controls.Add(_lblHonesty);
+
+            _lblHonestyTail = new Label();
+            _lblHonestyTail.Text = " · 云端不是唯一副本，本地文件请自行保留";
+            _lblHonestyTail.AutoSize = true;
+            _lblHonestyTail.Font = new Font("Microsoft YaHei UI", 9F);
+            // 正文 TextSecondary：同一背景 7.56:1
+            _lblHonestyTail.ForeColor = Theme.TextSecondary;
+            _lblHonestyTail.Margin = new Padding(0, Theme.S(3), 0, 0);
+            flow.Controls.Add(_lblHonestyTail);
+        }
+
+        /// <summary>进度行（36）：只放说明文字。进度条本体已内嵌进状态条（§3.4）。</summary>
+        private void BuildProgressRow()
+        {
+            _progressRow = new Panel();
+            _progressRow.Dock = DockStyle.Top;
+            _progressRow.Height = Theme.S(36);
+            _progressRow.BackColor = Theme.BgBar;
+            // padY 3：内容 30 ≥ 需要 28（label S(20)）（ADDENDUM 第 4 条）
+            _progressRow.Padding = new Padding(Theme.S(12), Theme.S(3), Theme.S(12), Theme.S(3));
+            Controls.Add(_progressRow);
+
+            _lblProgress = new Label();
+            _lblProgress.Dock = DockStyle.Fill;
+            _lblProgress.Text = "空闲";
+            _lblProgress.ForeColor = Theme.TextTertiary;
+            _lblProgress.Font = new Font("Microsoft YaHei UI", 9F);
+            _lblProgress.TextAlign = ContentAlignment.MiddleLeft;
+            _lblProgress.AutoEllipsis = true;
+            _progressRow.Controls.Add(_lblProgress);
+        }
+
+        /// <summary>标签条 + 页体宿主。</summary>
+        private void BuildTabsAndPages()
+        {
+            // 不用 TabControl：它的页体背景由系统视觉样式绘制，永远是 #F0F0F0，
+            // TabPages[i].BackColor 设了也不生效（实测）。深色窗口里那块白底
+            // 是"廉价感"的主要来源，且无法用任何属性消除。
             _tabStrip = new SegmentedTabs();
             _tabStrip.Tabs = new string[] { "备份", "设置" };
             _tabStrip.Dock = DockStyle.Top;
             _tabStrip.Height = Theme.S(36);
             _tabStrip.SelectedIndexChanged += delegate { SwitchTab(); };
+            // 无障碍（必修 1）：SegmentedTabs 目前不处理按键（全项目 OnKeyDown 0 处），
+            // 键盘用户无法切到「设置」页。B 会在控件内部修，这里先绕过，保证可用。
+            // 该控件不画焦点框，故移出 Tab 序列（TabStop=false），可用鼠标点选后按方向键。
+            _tabStrip.TabStop = false;
+            _tabStrip.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Right && _tabStrip.SelectedIndex < _tabStrip.Tabs.Length - 1)
+                { _tabStrip.SelectedIndex++; e.Handled = true; }
+                else if (e.KeyCode == Keys.Left && _tabStrip.SelectedIndex > 0)
+                { _tabStrip.SelectedIndex--; e.Handled = true; }
+                else if (e.KeyCode == Keys.Space)
+                { _tabStrip.SelectedIndex = (_tabStrip.SelectedIndex == 0) ? 1 : 0; e.Handled = true; }
+            };
             Controls.Add(_tabStrip);
 
             _pageHost = new Panel();
@@ -339,105 +531,35 @@ namespace ThunderPanSync
             BuildMainTab();
             BuildSettingsTab();
             SwitchTab();
+        }
 
-            // --- 底部按钮条 ---
-            var bottom = new Panel();
-            bottom.Dock = DockStyle.Bottom;
-            bottom.Height = 52;
-            bottom.BackColor = Theme.BgBar;
-            bottom.Padding = new Padding(12, 10, 12, 10);
-            Controls.Add(bottom);
+        /// <summary>底栏：高度 52，padY 8（FlatButton 自带 S(34) 高，10 会裁）。</summary>
+        private void BuildFooter()
+        {
+            _footer = new Panel();
+            _footer.Dock = DockStyle.Bottom;
+            _footer.Height = Theme.S(52);
+            _footer.BackColor = Theme.BgBar;
+            _footer.Padding = new Padding(Theme.S(12), Theme.S(8), Theme.S(12), Theme.S(8));
+            Controls.Add(_footer);
 
             _btnSync = MakeButton("立即同步一次", 130);
             _btnStart = MakeButton("开始自动备份", 130);
             _btnStop = MakeButton("停止", 80);
-            _btnLogin = MakeButton("需要登录迅雷云盘", 150);
             _btnOpenLog = MakeButton("打开日志文件", 120);
 
             var bflow = new FlowLayoutPanel();
             bflow.Dock = DockStyle.Fill;
             bflow.FlowDirection = FlowDirection.LeftToRight;
             bflow.WrapContents = false;
+            bflow.AutoScroll = false;
+            bflow.Margin = new Padding(0);
+            bflow.BackColor = Theme.BgBar;
             bflow.Controls.Add(_btnSync);
             bflow.Controls.Add(_btnStart);
             bflow.Controls.Add(_btnStop);
-            bflow.Controls.Add(_btnLogin);
             bflow.Controls.Add(_btnOpenLog);
-            bottom.Controls.Add(bflow);
-
-            // ---------------- 显式固定 Z 序（不靠 Add 的顺序猜） ----------------
-            //
-            // WinForms 的 Dock 规则：**后添加到 Controls 集合的 Dock=Top 控件更靠外**。
-            // 也就是说 Add 顺序和"从上到下"的视觉顺序是**相反**的，这非常反直觉，
-            // 而且写错了不会报错，只表现为"控件跑到奇怪的位置 / 被遮住"。
-            //
-            // 实测踩过：原来的 Add 顺序让 _pageHost(Fill) 抢到了 Tab 上方的空间，
-            // 结果进度条跑到页面中部、日志区被挤没、状态胶囊看不见。
-            //
-            // 所以这里不再依赖 Add 顺序，直接用 SetChildIndex 把 Z 序钉死：
-            //   index 0           = 最内层（Fill，吃剩余空间）
-            //   越靠后的 index     = 越靠外（先被 Dock 摆到边缘）
-            // 视觉从上到下：statusBar → progress → tabStrip → pageHost → footer
-            Controls.SetChildIndex(_pageHost, 0);       // Fill 必须最先（最内层）
-            Controls.SetChildIndex(_tabStrip, 1);
-            Controls.SetChildIndex(_progressPanel, 2);
-            Controls.SetChildIndex(statusBar, 3);
-            Controls.SetChildIndex(bottom, 4);          // Bottom 最外
-
-            _btnSync.Click += delegate { DoSync(); };
-            _btnStart.Click += delegate { DoSimple("start", "自动备份已启动"); };
-            _btnStop.Click += delegate { DoSimple("stop", "自动备份已停止"); };
-            _btnLogin.Click += delegate { DoLogin(false); };
-            _btnOpenLog.Click += delegate
-            {
-                // 日志已改为按天分文件（sync-YYYY-MM-DD.log），原来的固定名 sync.log
-                // 是历史遗留、不再更新 —— 打开它等于给用户看一个死文件。
-                // 优先用引擎 status 里给出的当天 logFile；拿不到再退回扫描目录。
-                var f = _currentLogFile;
-                if (string.IsNullOrEmpty(f) || !File.Exists(f))
-                {
-                    f = FindNewestLogFile();
-                }
-                if (!string.IsNullOrEmpty(f) && File.Exists(f))
-                {
-                    try { Process.Start("notepad.exe", "\"" + f + "\""); }
-                    catch (Exception ex) { MessageBox.Show("打开日志失败：" + ex.Message, "ThunderPanSync"); }
-                }
-                else
-                {
-                    MessageBox.Show("还没有日志文件。日志目录：" + _dataDir, "ThunderPanSync");
-                }
-            };
-
-            // --- 托盘 ---
-            _tray = new NotifyIcon();
-            _tray.Icon = SystemIcons.Application;
-            _tray.Text = "ThunderPanSync";
-            _tray.Visible = true;
-            var menu = new ContextMenuStrip();
-            menu.Items.Add("显示主窗口", null, delegate { ShowFromTray(); });
-            menu.Items.Add("立即同步一次", null, delegate { DoSync(); });
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("退出", null, delegate { QuitReally(); });
-            _tray.ContextMenuStrip = menu;
-            _tray.DoubleClick += delegate { ShowFromTray(); };
-
-            FormClosing += delegate(object s, FormClosingEventArgs e)
-            {
-                // 点 X = 最小化到托盘，不退出（备份继续跑）
-                if (!_reallyQuit)
-                {
-                    e.Cancel = true;
-                    Hide();
-                    // 这句必须说实话：只有在真正备份时才说"备份仍在运行"。
-                    // 之前无条件说这句，而引擎其实从没启动过 —— 评审抓出的"骗人"缺陷。
-                    if (_engineRunning)
-                        _tray.ShowBalloonTip(2000, "ThunderPanSync", "已最小化到托盘，备份仍在后台运行", ToolTipIcon.Info);
-                    else
-                        _tray.ShowBalloonTip(4000, "ThunderPanSync",
-                            "已最小化到托盘。注意：当前没有在备份，请点「开始自动备份」", ToolTipIcon.Warning);
-                }
-            };
+            _footer.Controls.Add(bflow);
         }
 
         /// <summary>切换标签页：只改两个 Panel 的可见性，不重建控件（重建会丢状态）。</summary>
@@ -447,7 +569,9 @@ namespace ThunderPanSync
             bool main = (_tabStrip.SelectedIndex == 0);
             _pageMain.Visible = main;
             _pageSettings.Visible = !main;
-            if (main) _pageMain.BringToFront(); else _pageSettings.BringToFront();
+            // 用索引而不是前台置顶：可见的那个放到索引 1（更靠外），另一个留在 0。
+            if (main) _pageHost.Controls.SetChildIndex(_pageMain, 1);
+            else _pageHost.Controls.SetChildIndex(_pageSettings, 1);
         }
 
         private void BuildMainTab()
@@ -456,58 +580,102 @@ namespace ThunderPanSync
             _pageMain.Dock = DockStyle.Fill;
             _pageMain.BackColor = Theme.BgSurface;
             _pageHost.Controls.Add(_pageMain);
-            var page = _pageMain;
+            Panel page = _pageMain;
 
-            // 文件夹列表
+            // 文件夹列表标签（高 26）
             var lbl = new Label();
-            lbl.Text = "监视的文件夹（里面的文件会自动备份到迅雷云盘）：";
+            lbl.Text = "监视的文件夹（里面的新文件会自动上传到迅雷云盘）：";
             lbl.Dock = DockStyle.Top;
-            lbl.Height = 26;
+            lbl.Height = Theme.S(26);
             lbl.ForeColor = Theme.TextPrimary;
+            lbl.AutoEllipsis = true;
             page.Controls.Add(lbl);
 
             _lvDirs = new DarkListView();
             _lvDirs.Dock = DockStyle.Top;
-            _lvDirs.Height = 150;
+            _lvDirs.Height = Theme.S(132);
             _lvDirs.View = View.Details;
             _lvDirs.FullRowSelect = true;
             _lvDirs.BackColor = Theme.BgSurfaceAlt;
             _lvDirs.Columns.Add("文件夹路径", 700);
             _lvDirs.FitColumns();
+            _lvDirs.TabStop = false;   // 列表靠鼠标选；不自绘焦点框，不进 Tab 序列
             page.Controls.Add(_lvDirs);
 
+            // 添加 / 移除按钮行（高 42，padY 3 ⇒ 内容 36 ≥ FlatButton 34）
             var dirBtns = new Panel();
             dirBtns.Dock = DockStyle.Top;
-            dirBtns.Height = 42;
-            dirBtns.Padding = new Padding(0, 6, 0, 6);
+            dirBtns.Height = Theme.S(42);
+            dirBtns.Padding = new Padding(0, Theme.S(3), 0, Theme.S(3));
+            dirBtns.BackColor = Theme.BgSurface;
             page.Controls.Add(dirBtns);
 
             _btnAddDir = MakeButton("添加文件夹…", 120);
-            _btnDelDir = MakeButton("移除选中", 100);
-            _btnAddDir.Location = new Point(0, 6);
-            _btnDelDir.Location = new Point(128, 6);
-            dirBtns.Controls.Add(_btnAddDir);
-            dirBtns.Controls.Add(_btnDelDir);
+            _btnDelDir = MakeButton("移除选中", 110);
+            var dirFlow = new FlowLayoutPanel();
+            dirFlow.Dock = DockStyle.Fill;
+            dirFlow.FlowDirection = FlowDirection.LeftToRight;
+            dirFlow.WrapContents = false;
+            dirFlow.AutoScroll = false;
+            dirFlow.Margin = new Padding(0);
+            dirFlow.BackColor = Theme.BgSurface;
+            dirFlow.Controls.Add(_btnAddDir);
+            dirFlow.Controls.Add(_btnDelDir);
+            dirBtns.Controls.Add(dirFlow);
 
             _btnAddDir.Click += delegate { AddDir(); };
             _btnDelDir.Click += delegate { DelDir(); };
 
-            // 日志 + 失败列表（左右分栏）
-            var split = new SplitContainer();
-            split.Dock = DockStyle.Fill;
-            split.Orientation = Orientation.Horizontal;
-            split.SplitterDistance = 260;
-            split.BackColor = Theme.Border;
-            page.Controls.Add(split);
+            // 失败区：Bottom，三档 0 / 44 / 156（A4）。0 = 没有失败（整块隐藏），
+            // 44 = 只显示一行摘要（不再让列表抢走日志的高度），156 = 标签 24 + 列表 132。
+            _failPanel = new Panel();
+            _failPanel.Dock = DockStyle.Bottom;
+            _failPanel.Visible = false;
+            _failPanel.BackColor = Theme.BgSurface;
+            page.Controls.Add(_failPanel);
 
+            _lblFail = new Label();
+            _lblFail.Text = "失败的文件（原因在这里，修好后点「立即同步一次」会重试）：";
+            _lblFail.Dock = DockStyle.Top;
+            _lblFail.Height = Theme.S(24);
+            _lblFail.ForeColor = Theme.TextPrimary;
+            _lblFail.AutoEllipsis = true;
+            _failPanel.Controls.Add(_lblFail);
+
+            _lblFailSummary = new Label();
+            _lblFailSummary.Dock = DockStyle.Top;
+            _lblFailSummary.Height = Theme.S(20);
+            _lblFailSummary.ForeColor = Theme.TextSecondary;
+            _lblFailSummary.AutoEllipsis = true;
+            _lblFailSummary.Visible = false;
+            _failPanel.Controls.Add(_lblFailSummary);
+
+            _lvFail = new DarkListView();
+            _lvFail.Dock = DockStyle.Fill;
+            _lvFail.View = View.Details;
+            _lvFail.FullRowSelect = true;
+            _lvFail.GridLines = false;
+            _lvFail.BackColor = Theme.BgSurfaceAlt;
+            _lvFail.ForeColor = Theme.TextPrimary;
+            // ToolTipText 之前设了但从不显示：ShowItemToolTips 默认 false（B-2）
+            _lvFail.ShowItemToolTips = true;
+            _lvFail.Columns.Add("文件", 240);
+            _lvFail.Columns.Add("次数", 50);
+            _lvFail.Columns.Add("原因", 420);
+            _lvFail.FitColumns();
+            _lvFail.TabStop = false;
+            _failPanel.Controls.Add(_lvFail);
+
+            // 日志（Fill）
             var logPanel = new Panel();
             logPanel.Dock = DockStyle.Fill;
-            split.Panel1.Controls.Add(logPanel);
+            logPanel.BackColor = Theme.BgSurface;
+            page.Controls.Add(logPanel);
 
             var lblLog = new Label();
             lblLog.Text = "运行日志：";
             lblLog.Dock = DockStyle.Top;
-            lblLog.Height = 24;
+            lblLog.Height = Theme.S(24);
             lblLog.ForeColor = Theme.TextPrimary;
             logPanel.Controls.Add(lblLog);
 
@@ -517,137 +685,23 @@ namespace ThunderPanSync
             _txtLog.ReadOnly = true;
             _txtLog.ScrollBars = ScrollBars.Vertical;
             _txtLog.BackColor = Theme.BgInset;
-            _txtLog.ForeColor = Color.FromArgb(180, 200, 220);
+            _txtLog.ForeColor = Theme.TextSecondary;
             _txtLog.Font = new Font("Consolas", 9F);
             _txtLog.BorderStyle = BorderStyle.None;
             logPanel.Controls.Add(_txtLog);
-            _txtLog.BringToFront();
-            lblLog.BringToFront();
+            // A-9：日志一显示就全文选中会整块变选中蓝（白像素 ×4）
+            _txtLog.Select(0, 0);
 
-            // 失败文件列表：引擎早就通过 status 返回了 failedFiles（含原因），
-            // 但原界面只把 failedTotal 显示成一个数字，用户永远看不到"哪个文件、为什么失败"。
-            var failPanel = new Panel();
-            failPanel.Dock = DockStyle.Fill;
-            split.Panel2.Controls.Add(failPanel);
-
-            var lblFail = new Label();
-            lblFail.Text = "失败的文件（原因在这里，修好后点「立即同步一次」会重试）：";
-            lblFail.Dock = DockStyle.Top;
-            lblFail.Height = 24;
-            lblFail.ForeColor = Theme.TextPrimary;
-            failPanel.Controls.Add(lblFail);
-
-            _lvFail = new DarkListView();
-            _lvFail.Dock = DockStyle.Fill;
-            _lvFail.View = View.Details;
-            _lvFail.FullRowSelect = true;
-            _lvFail.GridLines = false;
-            _lvFail.BackColor = Theme.BgSurfaceAlt;
-            _lvFail.ForeColor = Theme.TextPrimary;
-            _lvFail.Columns.Add("文件", 240);
-            _lvFail.Columns.Add("次数", 50);
-            _lvFail.Columns.Add("原因", 420);
-            _lvFail.FitColumns();
-            failPanel.Controls.Add(_lvFail);
-            _lvFail.BringToFront();
-            lblFail.BringToFront();
-
-            // 让上面的 Dock=Top 控件按顺序占位
-            dirBtns.BringToFront();
-            _lvDirs.BringToFront();
-            lbl.BringToFront();
+            // 页体内部 Z 序（DECISIONS §3.3）：Fill 占 0，Bottom 其次，Top 越靠前索引越大
+            page.Controls.SetChildIndex(logPanel, 0);
+            page.Controls.SetChildIndex(_failPanel, 1);
+            page.Controls.SetChildIndex(dirBtns, 2);
+            _pageMain.Controls.SetChildIndex(_lvDirs, 3);
+            _pageMain.Controls.SetChildIndex(lbl, 4);
         }
 
-        private void BuildSettingsTab()
-        {
-            _pageSettings = new Panel();
-            _pageSettings.Dock = DockStyle.Fill;
-            _pageSettings.BackColor = Theme.BgSurface;
-            _pageSettings.AutoScroll = true;
-            _pageHost.Controls.Add(_pageSettings);
-            var page = _pageSettings;
-
-            var y = 20;
-            page.Controls.Add(MakeLabel("远程文件夹名（云盘里的目录名）：", 20, y)); y += 24;
-            _txtRemoteName = MakeInput(20, y, 300); page.Controls.Add(_txtRemoteName); y += 40;
-
-            page.Controls.Add(MakeLabel("检查间隔（秒，最小 10）：", 20, y)); y += 24;
-            _txtInterval = MakeInput(20, y, 120); page.Controls.Add(_txtInterval); y += 40;
-
-            page.Controls.Add(MakeLabel("文件稳定判定（秒，避免传半截文件）：", 20, y)); y += 24;
-            _txtSettle = MakeInput(20, y, 120); page.Controls.Add(_txtSettle); y += 40;
-
-            page.Controls.Add(MakeLabel("单文件大小上限（MB）：", 20, y)); y += 24;
-            _txtMaxSize = MakeInput(20, y, 120); page.Controls.Add(_txtMaxSize); y += 40;
-
-            _chkAutoStart = new CheckBox();
-            _chkAutoStart.Text = "开机时自动启动";
-            _chkAutoStart.Location = new Point(20, y);
-            _chkAutoStart.Width = 300;
-            _chkAutoStart.ForeColor = Theme.TextPrimary;
-            page.Controls.Add(_chkAutoStart); y += 40;
-
-            _btnSave = MakeButton("保存设置", 120);
-            _btnSave.Location = new Point(20, y);
-            page.Controls.Add(_btnSave);
-            _btnSave.Click += delegate { SaveSettings(); };
-
-            var hint = MakeLabel("备份不会删除本地文件。日志与配置存放在：" + _dataDir, 20, y + 50);
-            hint.Width = 900;
-            hint.ForeColor = Theme.TextTertiary;
-            page.Controls.Add(hint);
-        }
 
         // ---------------- 小工具 ----------------
-        private Label MakeStatusLabel(string text, Color c)
-        {
-            var l = new Label();
-            l.Text = text;
-            l.AutoSize = true;
-            l.ForeColor = c;
-            l.Margin = new Padding(0, 6, 0, 0);
-            l.Font = new Font("Microsoft YaHei UI", 9.5F);
-            return l;
-        }
-        private Control Spacer(int w)
-        {
-            var p = new Panel();
-            p.Width = w;
-            p.Height = 1;
-            return p;
-        }
-        private Button MakeButton(string text, int w)
-        {
-            var b = new Button();
-            b.Text = text;
-            b.Width = w;
-            b.Height = 30;
-            b.FlatStyle = FlatStyle.Flat;
-            b.BackColor = Theme.BgSurfaceAlt;
-            b.ForeColor = Theme.TextPrimary;
-            b.FlatAppearance.BorderColor = Color.FromArgb(70, 75, 82);
-            b.Margin = new Padding(0, 0, 8, 0);
-            return b;
-        }
-        private Label MakeLabel(string text, int x, int y)
-        {
-            var l = new Label();
-            l.Text = text;
-            l.Location = new Point(x, y);
-            l.AutoSize = true;
-            l.ForeColor = Theme.TextPrimary;
-            return l;
-        }
-        private TextBox MakeInput(int x, int y, int w)
-        {
-            var t = new TextBox();
-            t.Location = new Point(x, y);
-            t.Width = w;
-            t.BackColor = Theme.BgSurfaceAlt;
-            t.ForeColor = Theme.TextPrimary;
-            t.BorderStyle = BorderStyle.FixedSingle;
-            return t;
-        }
 
         // ---------------- 引擎 ----------------
         private void StartEngine()
@@ -655,11 +709,54 @@ namespace ThunderPanSync
             try
             {
                 var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-                var node = Path.Combine(baseDir, "runtime", "node.exe");
                 var host = Path.Combine(baseDir, "engine", "host.js");
 
-                if (!File.Exists(node)) { UiFatal("找不到 node.exe：" + node); return; }
-                if (!File.Exists(host)) { UiFatal("找不到 host.js：" + host); return; }
+                // node.exe 查找顺序（P1-b）：
+                //   1. <exe目录>\runtime\node.exe        正常安装结构
+                //   2. <exe目录>\..\publish\runtime\...  开发时从 native\ 直接跑 exe
+                //   3. D:\Nodejs\node.exe                本机开发环境
+                //   4. PATH 里逐个目录找 node.exe
+                // 原来只认第 1 条，于是从 native\ 跑 dev build 必然是
+                // 「引擎异常：找不到 node.exe」+ 写 ui-fatal.log（实测 3 次）。
+                var tried = new List<string>();
+                string node = null;
+                var cand = new List<string>();
+                cand.Add(Path.Combine(baseDir, "runtime", "node.exe"));
+                cand.Add(Path.GetFullPath(Path.Combine(baseDir, "..", "publish", "runtime", "node.exe")));
+                cand.Add(@"D:\Nodejs\node.exe");
+                string pathEnv = Environment.GetEnvironmentVariable("PATH");
+                if (!string.IsNullOrEmpty(pathEnv))
+                {
+                    string[] dirs = pathEnv.Split(';');
+                    for (int k = 0; k < dirs.Length; k++)
+                    {
+                        string dk = dirs[k];
+                        if (string.IsNullOrEmpty(dk)) continue;
+                        try { cand.Add(Path.Combine(dk.Trim(), "node.exe")); }
+                        catch (Exception) { }
+                    }
+                }
+                for (int k = 0; k < cand.Count; k++)
+                {
+                    string c = cand[k];
+                    if (string.IsNullOrEmpty(c)) continue;
+                    tried.Add(c);
+                    try { if (File.Exists(c)) { node = c; break; } }
+                    catch (Exception) { }
+                }
+
+                if (node == null)
+                {
+                    string msg = "找不到 node.exe，已尝试：" + string.Join(" | ", tried.ToArray());
+                    UiFatal(msg);
+                    return;
+                }
+                if (!File.Exists(host))
+                {
+                    UiFatal("找不到 host.js：" + host);
+                    return;
+                }
+                AppendLog("引擎使用的 node：" + node);
 
                 _host.Start(node, host, _dataDir);
 
@@ -667,7 +764,7 @@ namespace ThunderPanSync
                 //
                 // 为什么不是"固定等 10 秒然后判死"：
                 // 实测踩到过 —— 在 LZMA 压 105 MB node.exe 的同时启动应用，
-                // host.js 没能在 10 秒内吐出 ready，界面就被判成"● 引擎异常 /
+                // host.js 没能在 10 秒内吐出 ready，界面就被判成"引擎异常 /
                 // 已停止（引擎异常）"，而且【永久停在这个假告警上】；实际上引擎
                 // 几秒后就正常就绪了。用户的机器会同时跑杀毒扫描、Windows 更新、
                 // 压缩包，这不是罕见场景。
@@ -685,8 +782,8 @@ namespace ThunderPanSync
                         slowNotified = true;
                         UiInvoke(delegate
                         {
-                            _lblState.Text = "● 引擎启动较慢，仍在等…";
-                            _lblState.ForeColor = Theme.Warn;
+                            // 状态文字统一由 RefreshUiState 决定（A-1：唯一入口）
+                            RefreshUiState();
                             SetProgressIdle("引擎启动较慢（机器繁忙时正常），请稍候…");
                         });
                     }
@@ -703,8 +800,8 @@ namespace ThunderPanSync
                     AppendLog("引擎启动较慢，现已就绪（机器繁忙时属正常现象）");
                 }
 
-                // 不显示"● 就绪"——那会让人以为在备份。
-                // 真实状态由 RefreshStatus 根据 running 判定（未在备份时是红色）。
+                // 引擎就绪是 Error 态的唯一闸门（A-1：启动期绝不判 Error）
+                _engineReady = true;
                 RefreshStatus();
 
                 // 浏览器与登录态：放在引擎就绪之后做，避免拖慢界面
@@ -803,22 +900,6 @@ namespace ThunderPanSync
             t.Start();
         }
 
-        private void UpdateLoginUi()
-        {
-            // 注意：这里不再改 _lblState。运行状态只能由 running 决定，
-            // 登录状态只属于按钮。两者混用会出现"已登录✓ + 绿色就绪"但实际没备份的误导。
-            if (_loggedIn)
-            {
-                _btnLogin.Text = "已登录 ✓";
-                _btnLogin.BackColor = Theme.BgSurfaceAlt;
-                _btnLogin.Enabled = true;   // 仍可点击（重新登录）
-            }
-            else
-            {
-                _btnLogin.Text = "需要登录迅雷云盘";
-                _btnLogin.BackColor = Theme.Warn;
-            }
-        }
 
         private void WireEngine()
         {
@@ -833,8 +914,13 @@ namespace ThunderPanSync
             {
                 UiInvoke(delegate
                 {
-                    // 一轮结束：把进度条收回到"空闲"，否则会停在 100% 骗人
-                    SetProgressIdle("空闲（上一轮已结束）");
+                    // A-2（阻断级缺陷）：这里原来无条件 SetProgressIdle("空闲（上一轮已结束）")。
+                    // 事件顺序是 progress(done) → run-complete，两者都走 UiInvoke/BeginInvoke（FIFO 保证覆盖），
+                    // 于是 ApplyProgress 刚写好的失败文案被这句抹掉：致命轮显示成空闲，成功轮的文案同样被抹。
+                    // 现在只在"本轮没有致命错误"时才把进度行收回到空闲。
+                    if (string.IsNullOrEmpty(_lastRoundFatalCode))
+                        SetProgressIdle("空闲（上一轮已结束）");
+                    RefreshUiState();
                     RefreshStatus();
                 });
             };
@@ -859,157 +945,7 @@ namespace ThunderPanSync
 
         // ---------------- 进度显示 ----------------
         // 字段名严格照 plan.md WP1：phase/index/total/name/size/bytesDone/bytesTotal/elapsedMs/etaMs
-        private void ApplyProgress(Dictionary<string, object> d)
-        {
-            if (d == null || _progress == null) return;
-            string phase = GetStr(d, "phase", "uploading");
-            int idx = GetInt(d, "index", 0);
-            int total = GetInt(d, "total", 0);
-            string name = GetStr(d, "name", "");
-            long bytesDone = GetLong(d, "bytesDone", 0);
-            long bytesTotal = GetLong(d, "bytesTotal", 0);
-            long elapsedMs = GetLong(d, "elapsedMs", 0);
-            long etaMs = GetLong(d, "etaMs", -1);
 
-            if (phase == "done")
-            {
-                // "完成"这个词必须与实际结果一致。
-                //
-                // 实测确证过的严重缺陷：致命失败轮与"真的没有文件要传"的成功轮，
-                // uploaded/failed 完全一样（都是 0/0），只靠这两个字段无法区分：
-                //   浏览器连不上 -> uploaded=0 failed=0 total=0
-                //   真的没文件   -> uploaded=0 failed=0 total=0
-                // 老实现按 failed==0 判定，把前者显示成
-                //   "完成 · 成功 0 个文件" + 绿色满格进度条
-                // 而实际一个字节都没传。这是最隐蔽的一类"界面说谎"：
-                // 外观完全正常，用户看到"完成"之后就不会再检查。
-                // 引擎现在会带 fatalCode，必须优先用它。
-                string fatalCode = GetStr(d, "fatalCode", null);
-                int up = GetInt(d, "uploaded", -1);
-                int bad = GetInt(d, "failed", -1);
-                bool fatal = !string.IsNullOrEmpty(fatalCode);
-
-                if (fatal)
-                {
-                    // 整轮级故障：说清原因，绝不出现"完成"二字
-                    _lblProgress.Text = "本轮失败 · " + FatalCodeText(fatalCode);
-                    _lblProgress.ForeColor = Theme.Danger;
-                    try { _progress.Value = Math.Min(_progress.Maximum, 999); } catch { }
-                    try { _progress.ForeColor = Theme.Danger; } catch { }
-                }
-                else
-                {
-                    if (up < 0 || bad < 0)
-                    {
-                        // 老引擎没给这两个字段，退回中性措辞，不硬说"完成"
-                        SetProgressIdle("本轮结束 · 共 " + total + " 个文件");
-                    }
-                    else if (bad == 0)
-                    {
-                        SetProgressIdle("完成 · 成功 " + up + " 个文件");
-                    }
-                    else if (up == 0)
-                    {
-                        _lblProgress.Text = "本轮失败 " + bad + " 个文件（详见下方失败列表）";
-                        _lblProgress.ForeColor = Theme.Danger;
-                    }
-                    else
-                    {
-                        _lblProgress.Text = "部分成功 · 成功 " + up + "，失败 " + bad
-                            + "（详见下方失败列表）";
-                        _lblProgress.ForeColor = Theme.Warn;
-                    }
-                    if (bad == 0)
-                    {
-                        try { _progress.Value = 1000; } catch { }
-                        _lblProgress.ForeColor = Theme.Ok;
-                    }
-                    else if (bad < 0)
-                    {
-                        // 老引擎缺字段：不知道成败，就保持中性，既不说成功也不报假失败
-                        try { _progress.Value = 0; } catch { }
-                    }
-                    else
-                    {
-                        // 有失败时进度条不能停在"看起来快完成"的位置，也不能归零装作没事。
-                        // 设成一个明确的"未完成"值并把颜色标红，避免"满格后归零=成功"的误读。
-                        try { _progress.Value = Math.Min(_progress.Maximum, 999); } catch { }
-                        try { _progress.ForeColor = Theme.Danger; } catch { }
-                    }
-                }
-                return;
-            }
-            if (phase == "scanning")
-            {
-                _progress.Value = 0;
-                _lblProgress.ForeColor = Theme.TextPrimary;
-                _lblProgress.Text = "正在扫描…" + (total > 0 ? ("（" + total + " 个文件）") : "");
-                return;
-            }
-
-            // 总体进度 = 已完成的文件数 + 当前文件内的百分比
-            double pct = 0;
-            if (total > 0)
-            {
-                double inFile = bytesTotal > 0 ? ((double)bytesDone / (double)bytesTotal) : 0;
-                if (inFile < 0) inFile = 0;
-                if (inFile > 1) inFile = 1;
-                double doneFiles = Math.Max(0, idx - 1);
-                pct = (doneFiles + inFile) / (double)total;
-            }
-            else if (bytesTotal > 0)
-            {
-                pct = (double)bytesDone / (double)bytesTotal;
-            }
-            if (pct < 0) pct = 0;
-            if (pct > 1) pct = 1;
-            try { _progress.Value = (int)Math.Round(pct * 1000); } catch { }
-
-            string speed = "";
-            if (elapsedMs > 500 && bytesDone > 0)
-            {
-                double bps = (double)bytesDone * 1000.0 / (double)elapsedMs;
-                speed = FormatSize((long)bps) + "/s";
-            }
-
-            var sb = new StringBuilder();
-            sb.Append("第 ");
-            sb.Append(idx > 0 ? idx : 0);
-            sb.Append("/");
-            sb.Append(total);
-            if (!string.IsNullOrEmpty(name)) { sb.Append("  ·  "); sb.Append(name); }
-            if (bytesTotal > 0)
-            {
-                sb.Append("  ·  ");
-                sb.Append(FormatSize(bytesDone));
-                sb.Append(" / ");
-                sb.Append(FormatSize(bytesTotal));
-            }
-            if (speed.Length > 0) { sb.Append("  ·  "); sb.Append(speed); }
-            if (etaMs > 0)
-            {
-                sb.Append("  ·  剩余 ");
-                sb.Append(FormatEta(etaMs));
-            }
-
-            _lblProgress.ForeColor = Theme.TextPrimary;
-            _lblProgress.Text = sb.ToString();
-        }
-
-        private void SetProgressIdle(string text)
-        {
-            if (_progress == null) return;
-            try { _progress.Value = 0; } catch { }
-            if (_lblProgress != null)
-            {
-                // 只有"真的没事"时才用灰色。带失败信息时保持调用方设的告警色，
-                // 否则会出现"进度满格→归零→灰色中性文本"的成功错觉（实测复现过）。
-                bool looksLikeFailure = !string.IsNullOrEmpty(text)
-                    && (text.IndexOf("失败") >= 0 || text.IndexOf("未完成") >= 0);
-                if (!looksLikeFailure) _lblProgress.ForeColor = Theme.TextTertiary;
-                _lblProgress.Text = string.IsNullOrEmpty(text) ? "空闲" : text;
-            }
-        }
 
         /// <summary>把引擎的错误码翻成用户能看懂的一句话。</summary>
         private static string FatalCodeText(string code)
@@ -1040,32 +976,6 @@ namespace ThunderPanSync
             return (sec / 3600) + " 小时 " + ((sec % 3600) / 60) + " 分";
         }
 
-        private void UiFatal(string msg)
-        {
-            // 诊断：把"谁判了致命错误 + 调用栈"写进 ui-fatal.log。
-            // 没有这个，界面上那句"引擎异常"永远查不出是谁设的
-            // （实测遇到过：界面显示异常、引擎 log 却一片正常）。
-            try
-            {
-                var sb = new StringBuilder();
-                sb.AppendLine("[" + DateTime.Now.ToString("HH:mm:ss.fff") + "] UiFatal: " + msg);
-                sb.AppendLine(Environment.StackTrace);
-                File.AppendAllText(Path.Combine(_dataDir, "ui-fatal.log"), sb.ToString());
-            }
-            catch (Exception) { }
-
-            // 错误提示必须带引擎自己的话（stderr 尾部）。只显示"引擎进程已退出"
-            // 等于什么都没说，用户和我们都无从查起。
-            string detail = msg;
-            try { detail = _host.BuildFatalDetail(msg, 100); } catch { }
-            UiInvoke(delegate
-            {
-                _lblState.Text = "● 引擎异常";
-                _lblState.ForeColor = Theme.Danger;
-                AppendLog("[错误] " + detail);
-                SetProgressIdle("已停止（引擎异常）");
-            });
-        }
 
         private void UiInvoke(Action a)
         {
@@ -1139,149 +1049,8 @@ namespace ThunderPanSync
             t.Start();
         }
 
-        private void ApplyStatus(Dictionary<string, object> d)
-        {
-            try
-            {
-                var cfg = d.ContainsKey("config") ? d["config"] as Dictionary<string, object> : null;
-                var st = d.ContainsKey("status") ? d["status"] as Dictionary<string, object> : null;
-
-                if (cfg != null)
-                {
-                    _txtRemoteName.Text = GetStr(cfg, "remoteFolderName", "ThunderPanSync");
-                    _txtInterval.Text = (GetInt(cfg, "intervalMs", 60000) / 1000).ToString();
-                    _txtSettle.Text = (GetInt(cfg, "settleMs", 5000) / 1000).ToString();
-                    _txtMaxSize.Text = GetInt(cfg, "maxSizeMB", 2048).ToString();
-
-                    // 文件夹列表
-                    _lvDirs.Items.Clear();
-                    object wd;
-                    if (cfg.TryGetValue("watchDirs", out wd) && wd is object[])
-                    {
-                        foreach (var x in (object[])wd)
-                        {
-                            var it = new ListViewItem(Convert.ToString(x));
-                            _lvDirs.Items.Add(it);
-                        }
-                    }
-                }
-
-                if (st != null)
-                {
-                    bool running = st.ContainsKey("running") && Convert.ToBoolean(st["running"]);
-                    _engineRunning = running;
-
-                    // 熔断态必须单独显示。
-                    // circuitOpen / pausedReason / consecutiveFailures 早就由 getStatus() 返回，
-                    // 但界面一个字段都没读 —— 熔断期间 running 仍为 true，
-                    // 于是显示绿色「● 备份中」，而引擎只是每 5 分钟打一条"已熔断"的 warn。
-                    // 这是"界面说谎"的同类复发，比进度条严重得多。
-                    bool circuitOpen = st.ContainsKey("circuitOpen")
-                        && Convert.ToBoolean(st["circuitOpen"]);
-                    int consecFail = GetInt(st, "consecutiveFailures", 0);
-
-                    // 状态显示必须诚实。四态：
-                    //   已熔断   (红) —— 连续失败已暂停自动重试，必须刺眼
-                    //   备份中   (绿) —— 引擎在跑且未熔断
-                    //   未在备份 (红) —— 有目录但没跑
-                    //   未配置   (黄) —— 还没有监视目录
-                    bool hasDirs = _lvDirs.Items.Count > 0;
-                    if (circuitOpen)
-                    {
-                        _lblState.Text = "● 已暂停（连续失败 " + consecFail
-                            + " 轮，点「立即同步」重试）";
-                        _lblState.ForeColor = Theme.Danger;
-                    }
-                    else if (running)
-                    {
-                        _lblState.Text = "● 备份中";
-                        _lblState.ForeColor = Theme.Ok;
-                    }
-                    else if (hasDirs)
-                    {
-                        // 用户已经有目录却不跑了：必须明确告诉他"现在没在备份"
-                        _lblState.Text = "● 未在备份（点「开始自动备份」）";
-                        _lblState.ForeColor = Theme.Danger;
-                    }
-                    else
-                    {
-                        _lblState.Text = "● 尚未配置（请添加文件夹）";
-                        _lblState.ForeColor = Theme.Warn;
-                    }
-
-                    int total = 0;
-                    object up;
-                    if (st.TryGetValue("uploadedTotal", out up)) { try { total = Convert.ToInt32(up); } catch { } }
-                    _lblUploaded.Text = "已上传 " + total;
-
-                    int failed = 0;
-                    object ff;
-                    if (st.TryGetValue("failedTotal", out ff)) { try { failed = Convert.ToInt32(ff); } catch { } }
-                    _lblFailed.Text = "失败 " + failed;
-
-                    var rem = GetStr(st, "remoteFolderId", "");
-                    _lblRemote.Text = string.IsNullOrEmpty(rem) ? "远程 待创建" : "远程 " + GetStr(st, "remoteFolderName", "");
-
-                    // 渲染失败列表：引擎一直有这些数据，之前界面从不显示，
-                    // 用户只看到"失败 3"却不知道是哪三个、为什么。
-                    FillFailedList(st);
-
-                    // 记住当天日志路径，供"打开日志文件"按钮使用。
-                    // 日志按天分文件后，写死 "sync.log" 会打开一个不再更新的旧文件。
-                    var lf = GetStr(st, "logFile", "");
-                    if (!string.IsNullOrEmpty(lf)) _currentLogFile = lf;
-                }
-
-                _lblDirs.Text = "文件夹 " + _lvDirs.Items.Count;
-            }
-            catch { }
-        }
 
         // 把引擎返回的 failedFiles 渲染成列表（文件 / 次数 / 原因）
-        private void FillFailedList(Dictionary<string, object> st)
-        {
-            try
-            {
-                if (st == null || !st.ContainsKey("failedFiles"))
-                {
-                    if (_lvFail.Items.Count > 0) _lvFail.Items.Clear();
-                    return;
-                }
-                var arr = st["failedFiles"] as object[];
-                if (arr == null)
-                {
-                    if (_lvFail.Items.Count > 0) _lvFail.Items.Clear();
-                    return;
-                }
-
-                // 避免每次状态刷新都重建（会闪、会丢选中）
-                if (_lvFail.Items.Count == arr.Length) return;
-
-                _lvFail.BeginUpdate();
-                try
-                {
-                    _lvFail.Items.Clear();
-                    foreach (var o in arr)
-                    {
-                        var d = o as Dictionary<string, object>;
-                        if (d == null) continue;
-                        var full = GetStr(d, "file", "");
-                        var nameOnly = full;
-                        int slash = full.LastIndexOf('\\');
-                        if (slash >= 0 && slash + 1 < full.Length) nameOnly = full.Substring(slash + 1);
-                        if (nameOnly.Length == 0) nameOnly = full;
-
-                        var it = new ListViewItem(nameOnly);
-                        it.ToolTipText = full;
-                        it.SubItems.Add(GetInt(d, "count", 0).ToString());
-                        it.SubItems.Add(GetStr(d, "error", "(无原因)"));
-                        _lvFail.Items.Add(it);
-                    }
-                }
-                finally { _lvFail.EndUpdate(); }
-            }
-            catch { }
-        }
 
         private static string GetStr(Dictionary<string, object> d, string k, string def)
         {
@@ -1322,7 +1091,7 @@ namespace ThunderPanSync
             if (d == null || !d.ContainsKey(k) || d[k] == null) return def;
             try { return Convert.ToInt32(d[k]); } catch { return def; }
         }
-        // 字节数与 etaMs 可能超过 int 范围（大文件/长剩余时间），必须按 long 取
+        // 字节数与 etaMs 可能超过 int 范围（大文件 / 时间跨度大），必须按 long 取
         private static long GetLong(Dictionary<string, object> d, string k, long def)
         {
             if (d == null || !d.ContainsKey(k) || d[k] == null) return def;
@@ -1330,24 +1099,47 @@ namespace ThunderPanSync
         }
 
         // ---------------- 操作 ----------------
+
         private void DoSync()
         {
             _btnSync.Enabled = false;
-            AppendLog("开始同步…");
+            AppendLog("正在开始一轮上传…");
             var t = new Thread(delegate()
             {
                 var d = _host.CallData("runOnce", null, 300000);
                 UiInvoke(delegate
                 {
                     _btnSync.Enabled = true;
-                    if (d == null) { AppendLog("[错误] 同步失败或无响应"); }
+                    if (d == null)
+                    {
+                        AppendLog("[错误] 同步失败或无响应");
+                    }
                     else
                     {
-                        AppendLog("完成：扫描 " + GetInt(d, "scanned", 0) +
-                                  "，上传 " + GetInt(d, "uploaded", 0) +
-                                  "，失败 " + GetInt(d, "failed", 0) +
-                                  "，跳过 " + GetInt(d, "skipped", 0));
+                        // A-6：这是与 ApplyProgress 无关的第二条播报路径。
+                        // 致命轮（fatalCode 非空但 failed=0）时这里曾播报成功，必须同样看 fatalCode。
+                        int scanned = GetInt(d, "scanned", 0);
+                        int up = GetInt(d, "uploaded", 0);
+                        int bad = GetInt(d, "failed", 0);
+                        int skip = GetInt(d, "skipped", 0);
+                        string fatal = GetStr(d, "fatalCode", null);
+                        if (!string.IsNullOrEmpty(fatal))
+                        {
+                            AppendLog("本轮失败：" + FatalCodeText(fatal)
+                                + "（扫描 " + scanned + "，上传 " + up + "，失败 " + bad + "，跳过 " + skip + "）");
+                        }
+                        else if (bad > 0)
+                        {
+                            AppendLog("本轮结束但有失败：扫描 " + scanned + "，上传 " + up
+                                + "，失败 " + bad + "，跳过 " + skip + "（原因见下方失败列表）");
+                        }
+                        else
+                        {
+                            AppendLog("本轮结束：扫描 " + scanned + "，上传 " + up
+                                + "，失败 " + bad + "，跳过 " + skip);
+                        }
                     }
+                    RefreshUiState();
                     RefreshStatus();
                 });
             });
@@ -1380,7 +1172,11 @@ namespace ThunderPanSync
                 if (string.Equals(it.Text, dlg.SelectedPath, StringComparison.OrdinalIgnoreCase)) return;
             }
             _lvDirs.Items.Add(new ListViewItem(dlg.SelectedPath));
-            _lblDirs.Text = "文件夹 " + _lvDirs.Items.Count;
+            _lvDirs.FitColumns();
+            _lvDirs.RefreshColumns();
+            _stDirsCount = _lvDirs.Items.Count;
+            if (_chipDirs != null) _chipDirs.Value = _stDirsCount.ToString();
+            RefreshUiState();
             SaveSettingsSilent();
         }
 
@@ -1388,27 +1184,12 @@ namespace ThunderPanSync
         {
             if (_lvDirs.SelectedItems.Count == 0) return;
             foreach (ListViewItem it in _lvDirs.SelectedItems) _lvDirs.Items.Remove(it);
-            _lblDirs.Text = "文件夹 " + _lvDirs.Items.Count;
+            _stDirsCount = _lvDirs.Items.Count;
+            if (_chipDirs != null) _chipDirs.Value = _stDirsCount.ToString();
+            RefreshUiState();
             SaveSettingsSilent();
         }
 
-        private Dictionary<string, object> CollectSettings()
-        {
-            var dirs = new List<string>();
-            foreach (ListViewItem it in _lvDirs.Items) dirs.Add(it.Text);
-
-            var cfg = new Dictionary<string, object>();
-            cfg["watchDirs"] = dirs.ToArray();
-            cfg["remoteFolderName"] = string.IsNullOrEmpty(_txtRemoteName.Text.Trim()) ? "ThunderPanSync" : _txtRemoteName.Text.Trim();
-            int iv = 60, st = 5, mx = 2048;
-            try { iv = Math.Max(10, int.Parse(_txtInterval.Text)); } catch { }
-            try { st = Math.Max(0, int.Parse(_txtSettle.Text)); } catch { }
-            try { mx = Math.Max(1, int.Parse(_txtMaxSize.Text)); } catch { }
-            cfg["intervalMs"] = iv * 1000;
-            cfg["settleMs"] = st * 1000;
-            cfg["maxSizeMB"] = mx;
-            return cfg;
-        }
 
         private void SaveSettingsSilent()
         {
@@ -1511,5 +1292,829 @@ namespace ThunderPanSync
                 if (a == "--autostart") { WindowState = FormWindowState.Minimized; Hide(); break; }
             }
         }
+        private void BuildSettingsTab()
+        {
+            _pageSettings = new Panel();
+            _pageSettings.Dock = DockStyle.Fill;
+            _pageSettings.BackColor = Theme.BgSurface;
+            _pageSettings.AutoScroll = true;
+            _pageHost.Controls.Add(_pageSettings);
+
+            // 用 TableLayoutPanel（2 列：标签 / 控件）替掉所有
+            // "Location = new Point(20, y)" + "y += 24/40" 的手算：
+            // 9.5pt 行高在 100/150/200% 是 19/25/35px，y+=24 在 ≥150% 必然重叠（200% 叠 11px）。
+            var grid = new TableLayoutPanel();
+            grid.Dock = DockStyle.Top;
+            // Dock=Top 且 AutoSize=false 时【必须显式给 Height】，否则 TableLayoutPanel
+            // 保留自己的默认高度（约 100px），只露出前 2 行 —— 实测踩过：设置页只显示
+            // "云盘文件夹名字"和"多久找一次新文件"，后 3 项（改完多久后才上传 /
+            // 单个文件最大 / 开机自启）连同"保存设置"全部被裁掉，
+            // 看起来像"设置项没做完"，实际是布局漏了一行 Height。
+            grid.AutoSize = false;
+            grid.AutoSizeMode = AutoSizeMode.GrowOnly;
+            grid.ColumnCount = 2;
+            grid.RowCount = 7;
+            grid.BackColor = Theme.BgSurface;
+            grid.Padding = new Padding(0, Theme.S(8), 0, Theme.S(8));
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(320)));
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            // Height 必须等于"行高之和 + 上下 Padding"，否则行会被压缩或拉伸：
+            //   6×S(52) + 1×S(56) = S(368)，加 Padding 2×S(8) = S(16) ⇒ S(384)
+            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, Theme.S(52)));
+            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, Theme.S(52)));
+            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, Theme.S(52)));
+            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, Theme.S(52)));
+            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, Theme.S(52)));
+            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, Theme.S(52)));
+            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, Theme.S(56)));
+            grid.Height = Theme.S(384);
+            _pageSettings.Controls.Add(grid);
+
+            _txtRemoteName = new TextBox();
+            StyleInput(_txtRemoteName);
+            AddSettingRow(grid, 0, "云盘文件夹名字（云端目录）：", _txtRemoteName);
+
+            _cboInterval = MakeCombo(new ComboOption[] {
+                new ComboOption("每分钟找一次", "60"),
+                new ComboOption("每 5 分钟找一次", "300"),
+                new ComboOption("每 15 分钟找一次", "900"),
+                new ComboOption("每 30 分钟找一次", "1800"),
+                new ComboOption("每小时找一次", "3600") });
+            AddSettingRow(grid, 1, "多久找一次新文件：", _cboInterval);
+
+            _cboSettle = MakeCombo(new ComboOption[] {
+                new ComboOption("改完 5 秒后才上传", "5"),
+                new ComboOption("改完 15 秒后才上传", "15"),
+                new ComboOption("改完 30 秒后才上传", "30"),
+                new ComboOption("改完 1 分钟后才上传", "60"),
+                new ComboOption("改完 3 分钟后才上传", "180") });
+            AddSettingRow(grid, 2, "文件改完多久后才上传：", _cboSettle);
+
+            _cboMaxSize = MakeCombo(new ComboOption[] {
+                new ComboOption("最大 100 MB", "100"),
+                new ComboOption("最大 500 MB", "500"),
+                new ComboOption("最大 1 GB", "1024"),
+                new ComboOption("最大 2 GB", "2048"),
+                new ComboOption("最大 4 GB", "4096") });
+            AddSettingRow(grid, 3, "单个文件最大：", _cboMaxSize);
+
+            _chkAutoStart = new CheckBox();
+            _chkAutoStart.Text = "开机时自动启动";
+            _chkAutoStart.AutoSize = true;
+            _chkAutoStart.ForeColor = Theme.TextPrimary;
+            _chkAutoStart.Margin = new Padding(0, Theme.S(6), 0, 0);
+            AddSettingRow(grid, 4, "启动项：", _chkAutoStart);
+
+            _btnSave = MakeButton("保存设置", 120);
+            _btnSave.Click += delegate { SaveSettings(); };
+            AddSettingRow(grid, 5, "", _btnSave);
+
+            var hint = new Label();
+            hint.Text = "备份不会删除本地文件。日志与配置存放在：" + _dataDir;
+            hint.Dock = DockStyle.Fill;
+            hint.AutoEllipsis = true;
+            hint.ForeColor = Theme.TextTertiary;
+            hint.TextAlign = ContentAlignment.MiddleLeft;
+            hint.Margin = new Padding(0);
+            grid.Controls.Add(hint, 0, 6);
+            grid.SetColumnSpan(hint, 2);
+
+            // 页脚占位：TableLayoutPanel 是 Top，其余空间留给背景，不要额外控件
+            _pageSettings.Controls.SetChildIndex(grid, 0);
+        }
+
+        private Button MakeButton(string text, int w)
+        {
+            var b = new Button();
+            b.Text = text;
+            b.Width = Theme.S(w);
+            // FlatButton 自带 S(34) 高（Widgets.cs L78）。用原生 Button 时也要 34，
+            // 否则 52 高的底栏在 150% 下会把文字底边裁掉（ADDENDUM：需要 34/51）。
+            b.Height = Theme.S(34);
+            b.FlatStyle = FlatStyle.Flat;
+            b.BackColor = Theme.BgSurfaceAlt;
+            b.ForeColor = Theme.TextPrimary;
+            b.FlatAppearance.BorderColor = Theme.BorderStrong;
+            b.Margin = new Padding(0, 0, Theme.S(8), 0);
+            return b;
+        }
+
+        /// <summary>登录态变化只影响状态条副信息与主操作按钮，不改运行状态。</summary>
+        private void UpdateLoginUi()
+        {
+            RefreshUiState();
+        }
+
+        private static void AddSettingRow(TableLayoutPanel grid, int row, string label, Control ctl)
+        {
+            if (!string.IsNullOrEmpty(label))
+            {
+                var l = new Label();
+                l.Text = label;
+                l.AutoSize = true;
+                l.ForeColor = Theme.TextPrimary;
+                l.TextAlign = ContentAlignment.MiddleLeft;
+                l.Margin = new Padding(0, Theme.S(14), Theme.S(12), 0);
+                grid.Controls.Add(l, 0, row);
+            }
+            ctl.Anchor = AnchorStyles.Left;
+            if (ctl is FlatCombo || ctl is ComboBox || ctl is Button)
+            {
+                ctl.Width = ctl is Button ? ctl.Width : Theme.S(320);
+            }
+            else if (ctl is TextBox)
+            {
+                ctl.Width = Theme.S(320);
+            }
+            if (ctl.Margin.Top < Theme.S(8)) ctl.Margin = new Padding(0, Theme.S(12), 0, 0);
+            grid.Controls.Add(ctl, 1, row);
+        }
+
+        private void StyleInput(TextBox t)
+        {
+            t.BackColor = Theme.BgSurfaceAlt;
+            t.ForeColor = Theme.TextPrimary;
+            t.BorderStyle = BorderStyle.FixedSingle;
+        }
+
+        /// <summary>下拉选择：自绘的 FlatCombo（原生 ComboBox 的白边框/箭头无解，见 FlatCombo.cs）。
+        private FlatCombo MakeCombo(ComboOption[] items)
+        {
+            var c = new FlatCombo();
+            c.Width = Theme.S(320);
+            int n = items == null ? 0 : items.Length;
+            var texts = new string[n];
+            var values = new string[n];
+            for (int i = 0; i < n; i++)
+            {
+                texts[i] = items[i].Text;
+                values[i] = items[i].Value;
+            }
+            c.SetItems(texts, values);
+            if (n > 0) c.SelectedIndex = 0;
+            return c;
+        }
+
+        /// <summary>设置项 -> 配置字典（全部从 ComboBox 读，不再 parseInt 文本框）。</summary>
+        private Dictionary<string, object> CollectSettings()
+        {
+            var dirs = new List<string>();
+            foreach (ListViewItem it in _lvDirs.Items) dirs.Add(it.Text);
+
+            var cfg = new Dictionary<string, object>();
+            cfg["watchDirs"] = dirs.ToArray();
+            string rn = _txtRemoteName == null ? "" : _txtRemoteName.Text.Trim();
+            cfg["remoteFolderName"] = string.IsNullOrEmpty(rn) ? "ThunderPanSync" : rn;
+
+            int iv = 60, st = 5, mx = 2048;
+            string s;
+            s = ComboValue(_cboInterval);
+            if (s != null) { try { iv = Math.Max(10, int.Parse(s)); } catch { } }
+            s = ComboValue(_cboSettle);
+            if (s != null) { try { st = Math.Max(0, int.Parse(s)); } catch { } }
+            s = ComboValue(_cboMaxSize);
+            if (s != null) { try { mx = Math.Max(1, int.Parse(s)); } catch { } }
+            cfg["intervalMs"] = iv * 1000;
+            cfg["settleMs"] = st * 1000;
+            cfg["maxSizeMB"] = mx;
+            return cfg;
+        }
+
+        private static string ComboValue(FlatCombo c)
+        {
+            if (c == null) return null;
+            string v = c.SelectedValue;
+            return string.IsNullOrEmpty(v) ? null : v;   // 空 = 没选中，调用方按"保持原值"处理
+        }
+        // ================= 状态机（DECISIONS §五 A-1）=================
+        //
+        // 唯一入口是 RefreshUiState()：任何地方都不许直接改 _pill 的文字，
+        // 否则"熔断显示绿色"这类说谎缺陷会以另一种形式复发。
+        //
+        // 两条硬规则：
+        //   1) Error 只有两个来源 —— _engineFatal，或"引擎已 ready 但 20 秒没有 status"。
+        //      启动期绝不判 Error：历史上"启动慢 10 秒就报引擎异常"是纯假告警。
+        //   2) Paused 必须在 Running 之前判 —— 熔断期 running 仍是 true，
+        //      先判 running 就会把"已暂停"显示成绿色"正在上传"。
+        private void RefreshUiState()
+        {
+            UiState s;
+            bool stale = _haveStatus && AgeMs(_lastStatusAt) > 20000;
+            if (_engineFatal) s = UiState.Error;
+            else if (!_haveStatus && _engineReady && AgeMs(_lastStatusAt) > 20000) s = UiState.Error;
+            else if (!_haveStatus) s = _engineRunning ? UiState.Running : UiState.Ready;
+            else if (_stCircuitOpen) s = UiState.Paused;
+            else if (_stDirsCount == 0) s = UiState.NotConfigured;
+            else if (_stRunning) s = UiState.Running;
+            else s = UiState.Ready;
+            _uiState = s;
+
+            string text;
+            Color c;
+            StatusPill.PillKind k;
+            if (s == UiState.Error)
+            {
+                text = _engineFatal ? "引擎异常" : "状态不可用";
+                c = Theme.Danger;
+                k = StatusPill.PillKind.Error;
+            }
+            else if (s == UiState.Paused)
+            {
+                text = "已暂停（连续失败 " + _stConsecFail + " 轮）";
+                c = Theme.Danger;
+                k = StatusPill.PillKind.Paused;
+            }
+            else if (s == UiState.NotConfigured)
+            {
+                text = "还没有添加文件夹";
+                c = Theme.Warn;
+                k = StatusPill.PillKind.NotConfigured;
+            }
+            else if (s == UiState.Running)
+            {
+                text = "正在上传";
+                c = Theme.Ok;
+                k = StatusPill.PillKind.Running;
+            }
+            else
+            {
+                text = "待命（没在上传）";
+                c = Theme.Warn;
+                k = StatusPill.PillKind.Configured;
+            }
+
+            // 状态过期：不冒充"最新的"，把最后更新时刻说清楚
+            if (s != UiState.Error && stale)
+            {
+                text = "状态不可用（最后更新 " + _lastStatusAt.ToString("HH:mm") + "）";
+                c = Theme.Danger;
+                k = StatusPill.PillKind.Error;
+            }
+
+            if (_pill != null)
+            {
+                _pill.PillState = k;
+                _pill.Text = text;
+                _pill.ForeColor = c;
+            }
+
+            // 进度行只在真正有轮次在跑时出现（A-7 的 24px 就是从这里支付的）
+            if (_progressRow != null)
+            {
+                // 致命轮结束后 _roundActive 已被 done 分支置 false，若只看它，进度行会立刻隐藏，
+            // 刚写进去的「本轮失败 · 原因」用户根本看不见（只有日志里有一行）。
+            // 所以致命轮保留进度行；_lastRoundFatalCode 在下一次 scanning 时清空。
+            bool showProgress = (s == UiState.Running) || _roundActive
+                || !string.IsNullOrEmpty(_lastRoundFatalCode);
+                if (_progressRow.Visible != showProgress) _progressRow.Visible = showProgress;
+            }
+
+            // 诚实性常驻条：只在 Running 态降级为单色（那正是用户最可能
+            // 误以为"备份=可恢复"的时刻，其余态加强提示）
+            if (_lblHonesty != null)
+            {
+                bool running = (s == UiState.Running);
+                _lblHonesty.ForeColor = running ? Theme.TextSecondary : Theme.Warn;
+                _lblHonestyTail.ForeColor = Theme.TextSecondary;
+            }
+
+            ResolvePrimaryAction();
+        }
+
+        private static long AgeMs(DateTime t)
+        {
+            if (t == DateTime.MinValue) return long.MaxValue;
+            long ms = (long)(DateTime.Now - t).TotalMilliseconds;
+            return ms < 0 ? 0 : ms;
+        }
+
+        /// <summary>主操作按钮的唯一判定点（DECISIONS §3.8：登录态只影响按钮，不改状态）。</summary>
+        private void ResolvePrimaryAction()
+        {
+            if (_btnSync == null) return;
+            bool loggedIn = _loggedIn;
+            if (!loggedIn)
+            {
+                _btnSync.Text = "登录迅雷云盘";
+                _btnSync.Enabled = true;
+                _btnStart.Enabled = false;
+                _chipLogin.Value = "未登录";
+                _chipLogin.ValueColor = Theme.Warn;
+            }
+            else
+            {
+                _btnSync.Text = "立即同步一次";
+                _btnSync.Enabled = (_uiState != UiState.Error);
+                _btnStart.Enabled = (_stDirsCount > 0);
+                _chipLogin.Value = "已登录";
+                _chipLogin.ValueColor = Theme.Ok;
+            }
+        }
+
+        private void DoPrimary()
+        {
+            if (!_loggedIn) { DoLogin(false); return; }
+            DoSync();
+        }
+
+        // ================= 定时器（A-4）=================
+        private void StartTimers()
+        {
+            _tickTimer = new System.Windows.Forms.Timer();
+            _tickTimer.Interval = 1000;
+            _tickTimer.Tick += delegate { OnTick(); };
+            _tickTimer.Start();
+
+            _pollTimer = new System.Windows.Forms.Timer();
+            _pollTimer.Interval = 10000;
+            _pollTimer.Tick += delegate { RefreshStatus(); };
+            _pollTimer.Start();
+        }
+
+        /// <summary>1 秒：秒表、相对时间、状态过期检测。</summary>
+        private void OnTick()
+        {
+            if (_roundActive && _roundStartedAt != DateTime.MinValue && _lblProgress != null)
+            {
+                // 只在该行还显示着进度文本时补秒表，避免把 done 分支的文案覆盖掉
+                string cur = _lblProgress.Text;
+                int at = cur.LastIndexOf("  ·  已用 ");
+                if (at >= 0) cur = cur.Substring(0, at);
+                _lblProgress.Text = cur + "  ·  已用 " + FormatElapsed(DateTime.Now - _roundStartedAt);
+            }
+            // 状态过期是"时间引起的变化"，没有 status 帧推不动它，必须靠 tick
+            RefreshUiState();
+        }
+
+        private static string FormatElapsed(TimeSpan ts)
+        {
+            if (ts.TotalSeconds < 0) ts = TimeSpan.Zero;
+            int total = (int)ts.TotalSeconds;
+            int m = total / 60;
+            int s = total % 60;
+            return m + ":" + (s < 10 ? "0" + s : s.ToString());
+        }
+
+        // ================= 进度（A-3：纯文件个数；不显示速率、不显示推算时间）=================
+        private void ApplyProgress(Dictionary<string, object> d)
+        {
+            if (d == null || _flatProgress == null) return;
+            string phase = GetStr(d, "phase", "uploading");
+            int idx = GetInt(d, "index", 0);
+            int total = GetInt(d, "total", 0);
+            string name = GetStr(d, "name", "");
+            long bytesDone = GetLong(d, "bytesDone", 0);
+            long bytesTotal = GetLong(d, "bytesTotal", 0);
+
+            if (phase == "done")
+            {
+                // 致命轮与"真的没文件"在 uploaded/failed 上完全同形（都是 0/0），
+                // 只有 fatalCode 能区分。这里必须先把 fatalCode 记下来给
+                // OnRunComplete 用（A-2 的覆盖 bug 就死在没这个字段上）。
+                string fatalCode = GetStr(d, "fatalCode", null);
+                _lastRoundFatalCode = fatalCode;
+                _roundActive = false;
+                _roundStartedAt = DateTime.MinValue;
+                int up = GetInt(d, "uploaded", -1);
+                int bad = GetInt(d, "failed", -1);
+
+                if (!string.IsNullOrEmpty(fatalCode))
+                {
+                    _flatProgress.Indeterminate = false;
+                    _flatProgress.Ratio = 0;
+                    _flatProgress.FillColor = Theme.Danger;
+                    _lblProgress.ForeColor = Theme.Danger;
+                    _lblProgress.Text = "本轮失败 · " + FatalCodeText(fatalCode);
+                }
+                else if (up < 0 || bad < 0)
+                {
+                    SetProgressIdle("本轮已结束 · 共 " + total + " 个文件");
+                }
+                else if (bad == 0)
+                {
+                    _flatProgress.Indeterminate = false;
+                    _flatProgress.Ratio = bad == 0 && up == 0 && total == 0 ? 0 : 1;
+                    _flatProgress.FillColor = Theme.Ok;
+                    _lblProgress.ForeColor = Theme.Ok;
+                    _lblProgress.Text = up == 0
+                        ? "本轮已结束 · 没有需要上传的新文件"
+                        : "本轮已结束 · 成功上传 " + up + " 个文件";
+                }
+                else
+                {
+                    _flatProgress.Indeterminate = false;
+                    _flatProgress.Ratio = up > 0 ? 1 : 0;
+                    _flatProgress.FillColor = Theme.Danger;
+                    _lblProgress.ForeColor = up > 0 ? Theme.Warn : Theme.Danger;
+                    _lblProgress.Text = up > 0
+                        ? "部分成功 · 成功 " + up + "，失败 " + bad + "（原因见下方失败列表）"
+                        : "本轮失败 " + bad + " 个文件（原因见下方失败列表）";
+                }
+                RefreshUiState();
+                return;
+            }
+
+            if (phase == "scanning")
+            {
+                // 新一轮开始：清掉上一轮的致命标记，否则 showProgress 会让进度行永久占着 36px
+                _lastRoundFatalCode = null;
+                SetProgressIdle("正在扫描…" + (total > 0 ? ("（" + total + " 个文件）") : ""));
+                RefreshUiState();
+                return;
+            }
+
+            // 上传中：进度 = 已完成文件数 / 总文件数（纯文件个数，不再把
+            // "文件数"和"文件内字节比"相加 —— 那是不同单位相加，会跳格）。
+            _roundActive = true;
+            if (_roundStartedAt == DateTime.MinValue) _roundStartedAt = DateTime.Now;
+
+            int doneFiles = idx > 0 ? idx - 1 : 0;
+            if (doneFiles > total) doneFiles = total;
+            if (total > 0)
+            {
+                _flatProgress.Indeterminate = false;
+                _flatProgress.Ratio = (double)doneFiles / (double)total;
+            }
+            else
+            {
+                // 总数未知：用不确定态流动，绝不假装百分比
+                _flatProgress.Indeterminate = true;
+            }
+            _flatProgress.FillColor = Theme.Info;
+
+            var sb = new StringBuilder();
+            sb.Append("第 ");
+            sb.Append(idx > 0 ? idx : 1);
+            sb.Append("/");
+            sb.Append(total);
+            if (!string.IsNullOrEmpty(name)) { sb.Append("  ·  "); sb.Append(name); }
+            if (bytesTotal > 0)
+            {
+                sb.Append("  ·  ");
+                sb.Append(FormatSize(bytesDone));
+                sb.Append(" / ");
+                sb.Append(FormatSize(bytesTotal));
+            }
+            if (_roundStartedAt != DateTime.MinValue)
+            {
+                sb.Append("  ·  已用 ");
+                sb.Append(FormatElapsed(DateTime.Now - _roundStartedAt));
+            }
+            _lblProgress.ForeColor = Theme.TextPrimary;
+            _lblProgress.Text = sb.ToString();
+            RefreshUiState();
+        }
+
+        private void SetProgressIdle(string text)
+        {
+            if (_flatProgress == null) return;
+            _flatProgress.Indeterminate = false;
+            _flatProgress.Ratio = 0;
+            _flatProgress.FillColor = Theme.Info;
+            if (_lblProgress != null)
+            {
+                // 只有"真的没事"时才用灰色：带失败信息时保持调用方设的告警色，
+                // 否则会出现"满格→归零→灰色中性文本"的成功错觉（实测复现过）。
+                bool looksLikeFailure = !string.IsNullOrEmpty(text)
+                    && (text.IndexOf("失败") >= 0 || text.IndexOf("未完成") >= 0);
+                if (!looksLikeFailure) _lblProgress.ForeColor = Theme.TextTertiary;
+                _lblProgress.Text = string.IsNullOrEmpty(text) ? "空闲" : text;
+            }
+        }
+
+        private void UiFatal(string msg)
+        {
+            // 诊断：把"谁判了致命错误 + 调用栈"写进 ui-fatal.log。
+            try
+            {
+                var sb = new StringBuilder();
+                sb.AppendLine("[" + DateTime.Now.ToString("HH:mm:ss.fff") + "] UiFatal: " + msg);
+                sb.AppendLine(Environment.StackTrace);
+                File.AppendAllText(Path.Combine(_dataDir, "ui-fatal.log"), sb.ToString());
+            }
+            catch (Exception) { }
+
+            string detail = msg;
+            try { detail = _host.BuildFatalDetail(msg, 100); } catch { }
+            UiInvoke(delegate
+            {
+                _engineFatal = true;
+                _engineRunning = false;
+                AppendLog("[错误] " + detail);
+                SetProgressIdle("已停止（引擎异常）");
+                RefreshUiState();
+            });
+        }
+
+        // ================= 状态渲染（ApplyStatus）=================
+        private void ApplyStatus(Dictionary<string, object> d)
+        {
+            try
+            {
+                var cfg = d.ContainsKey("config") ? d["config"] as Dictionary<string, object> : null;
+                var st = d.ContainsKey("status") ? d["status"] as Dictionary<string, object> : null;
+
+                if (cfg != null)
+                {
+                    // A-9：回填会吃掉用户正在输入的内容 —— 焦点在谁身上就不动谁
+                    if (_txtRemoteName != null && !_txtRemoteName.Focused)
+                        _txtRemoteName.Text = GetStr(cfg, "remoteFolderName", "ThunderPanSync");
+                    if (_cboInterval != null && !_cboInterval.Focused)
+                        SelectComboValue(_cboInterval, (GetInt(cfg, "intervalMs", 60000) / 1000).ToString(), " 分钟");
+                    if (_cboSettle != null && !_cboSettle.Focused)
+                        SelectComboValue(_cboSettle, (GetInt(cfg, "settleMs", 5000) / 1000).ToString(), " 秒");
+                    if (_cboMaxSize != null && !_cboMaxSize.Focused)
+                        SelectComboValue(_cboMaxSize, GetInt(cfg, "maxSizeMB", 2048).ToString(), " MB");
+
+                    // 文件夹列表：内容变了才重建（重建会丢选中、也会闪）
+                    var want = new List<string>();
+                    object wd;
+                    if (cfg.TryGetValue("watchDirs", out wd) && wd is object[])
+                    {
+                        foreach (var x in (object[])wd) want.Add(Convert.ToString(x));
+                    }
+                    bool same = (want.Count == _lvDirs.Items.Count);
+                    if (same)
+                    {
+                        for (int i = 0; i < want.Count; i++)
+                        {
+                            if (_lvDirs.Items[i].Text != want[i]) { same = false; break; }
+                        }
+                    }
+                    if (!same)
+                    {
+                        _lvDirs.BeginUpdate();
+                        try
+                        {
+                            _lvDirs.Items.Clear();
+                            for (int i = 0; i < want.Count; i++) _lvDirs.Items.Add(new ListViewItem(want[i]));
+                        }
+                        finally { _lvDirs.EndUpdate(); }
+                        _lvDirs.FitColumns();
+            _lvDirs.RefreshColumns();
+                    }
+                    _stDirsCount = _lvDirs.Items.Count;
+                    _chipDirs.Value = _stDirsCount.ToString();
+                }
+
+                if (st != null)
+                {
+                    _haveStatus = true;
+                    _lastStatusAt = DateTime.Now;
+                    _stRunning = st.ContainsKey("running") && Convert.ToBoolean(st["running"]);
+                    _stCircuitOpen = st.ContainsKey("circuitOpen") && Convert.ToBoolean(st["circuitOpen"]);
+                    _stConsecFail = GetInt(st, "consecutiveFailures", 0);
+                    // _engineRunning 的语义是"真的在自动备份"：熔断期 running 仍为 true，
+                    // 但那时并没有在上传，托盘/状态条都不能说"备份仍在运行"。
+                    _engineRunning = _stRunning && !_stCircuitOpen;
+
+                    _stUploadedTotal = GetInt(st, "uploadedTotal", 0);
+                    _stFailedTotal = GetInt(st, "failedTotal", 0);
+                    _chipUploaded.Value = _stUploadedTotal.ToString();
+                    _chipFailed.Value = _stFailedTotal.ToString();
+
+                    FillFailedList(st);
+
+                    var lf = GetStr(st, "logFile", "");
+                    if (!string.IsNullOrEmpty(lf)) _currentLogFile = lf;
+                }
+
+                if (_lvDirs != null)
+                {
+                    _stDirsCount = _lvDirs.Items.Count;
+                    _chipDirs.Value = _stDirsCount.ToString();
+                }
+                RefreshUiState();
+            }
+            catch { }
+        }
+
+        /// <summary>下拉框选中指定值；不在推荐列表里时追加一项（绝不静默取整）。</summary>
+        private static void SelectComboValue(FlatCombo cbo, string value, string unit)
+        {
+            if (cbo == null) return;
+            for (int i = 0; i < cbo.Count; i++)
+            {
+                if (cbo.ValueAt(i) == value)
+                {
+                    if (cbo.SelectedIndex != i) cbo.SelectedIndex = i;
+                    return;
+                }
+            }
+            // 非预设值（例如 3000 MB）：追加一项并选中，让用户看见真实配置
+            cbo.AddItem(value + unit + "（当前设置，不在推荐值里）", value);
+            cbo.SelectedIndex = cbo.Count - 1;
+        }
+
+        /// <summary>失败列表：按"内容签名"比较，不再只比数量（A-5）。</summary>
+        private void FillFailedList(Dictionary<string, object> st)
+        {
+            try
+            {
+                object raw;
+                object[] arr = null;
+                if (st != null && st.TryGetValue("failedFiles", out raw)) arr = raw as object[];
+
+                var sig = new StringBuilder();
+                int n = arr == null ? 0 : arr.Length;
+                for (int i = 0; i < n; i++)
+                {
+                    var e = arr[i] as Dictionary<string, object>;
+                    if (e == null) continue;
+                    sig.Append(GetStr(e, "file", "")).Append('\u0001');
+                    sig.Append(GetInt(e, "count", 0)).Append('\u0001');
+                    sig.Append(GetStr(e, "error", "")).Append('\u0002');
+                }
+                string s = sig.ToString();
+                if (s == _failSig) { UpdateFailPanelHeight(n); return; }
+                _failSig = s;
+
+                _lvFail.BeginUpdate();
+                try
+                {
+                    _lvFail.Items.Clear();
+                    for (int i = 0; i < n; i++)
+                    {
+                        var e = arr[i] as Dictionary<string, object>;
+                        if (e == null) continue;
+                        var full = GetStr(e, "file", "");
+                        var nameOnly = full;
+                        int slash = full.LastIndexOf('\\');
+                        if (slash >= 0 && slash + 1 < full.Length) nameOnly = full.Substring(slash + 1);
+                        if (nameOnly.Length == 0) nameOnly = full;
+
+                        var it = new ListViewItem(nameOnly);
+                        it.ToolTipText = full;
+                        it.SubItems.Add(GetInt(e, "count", 0).ToString());
+                        it.SubItems.Add(GetStr(e, "error", "(无原因)"));
+                        _lvFail.Items.Add(it);
+                    }
+                }
+                finally { _lvFail.EndUpdate(); }
+                _lvFail.FitColumns();
+                _lvFail.RefreshColumns();   // 加行让滚动条出现不触发 OnResize，列宽会停在旧值
+            _lvFail.TabStop = false;
+                UpdateFailPanelHeight(n);
+            }
+            catch { }
+        }
+
+        /// <summary>失败区三档：0（无失败）/ 44（只有摘要一行）/ 156（标签+列表）。</summary>
+        private void UpdateFailPanelHeight(int n)
+        {
+            if (_failPanel == null) return;
+            if (n <= 0)
+            {
+                _failPanel.Visible = false;
+                int failH = 0;
+                _failPanel.Height = failH;
+                _lblFailSummary.Visible = false;
+                _lvFail.Visible = false;
+                return;
+            }
+            _failPanel.Visible = true;
+            // failedFiles 只返回前 50 个，标题要说清"总共多少"
+            if (_stFailedTotal > n)
+                _lblFail.Text = "失败 " + _stFailedTotal + " 个，下面只显示前 " + n + " 个（原因见右列）：";
+
+            else
+                _lblFail.Text = "失败的文件（原因在这里，修好后点「立即同步一次」会重试）：";
+
+            if (n <= 2)
+            {
+                // 一两个失败不值得占用日志的高度：只显示一行摘要
+                _lvFail.Visible = false;
+                _lblFailSummary.Visible = true;
+                _lblFailSummary.Text = "共 " + n + " 个：" + (_lvFail.Items.Count > 0 ? _lvFail.Items[0].Text : "") + " 等";
+                _failPanel.Height = Theme.S(44);
+            }
+            else
+            {
+                _lvFail.Visible = true;
+                _lblFailSummary.Visible = false;
+                _failPanel.Height = Theme.S(156);
+            }
+        }
+
+        // ================= 托盘 / 表单事件 =================
+        private void BuildTray()
+        {
+            _tray = new NotifyIcon();
+            _tray.Icon = SystemIcons.Application;
+            _tray.Text = "ThunderPanSync";
+            _tray.Visible = true;
+            var menu = new ContextMenuStrip();
+            menu.Items.Add("显示主窗口", null, delegate { ShowFromTray(); });
+            menu.Items.Add("立即同步一次", null, delegate { DoSync(); });
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("退出", null, delegate { QuitReally(); });
+            _tray.ContextMenuStrip = menu;
+            _tray.DoubleClick += delegate { ShowFromTray(); };
+        }
+
+        private void WireFormEvents()
+        {
+            FormClosing += delegate(object s, FormClosingEventArgs e)
+            {
+                // 点 X = 最小化到托盘，不退出（备份继续跑）
+                if (!_reallyQuit)
+                {
+                    e.Cancel = true;
+                    Hide();
+                    // 这句必须说实话：只有真在备份时才说"备份仍在后台运行"
+                    if (_engineRunning)
+                        _tray.ShowBalloonTip(2000, "ThunderPanSync", "已最小化到托盘，备份仍在后台运行", ToolTipIcon.Info);
+                    else
+                        _tray.ShowBalloonTip(4000, "ThunderPanSync",
+                            "已最小化到托盘。注意：当前没有在备份", ToolTipIcon.Warning);
+                }
+            };
+        }
+
+        private void OpenLogFile()
+        {
+            // 日志按天分文件，打开写死的 sync.log 等于给用户看一个死文件
+            var f = _currentLogFile;
+            if (string.IsNullOrEmpty(f) || !File.Exists(f)) f = FindNewestLogFile();
+            if (!string.IsNullOrEmpty(f) && File.Exists(f))
+            {
+                try { Process.Start("notepad.exe", "\"" + f + "\""); }
+                catch (Exception ex) { MessageBox.Show("打开日志失败：" + ex.Message, "ThunderPanSync"); }
+            }
+            else
+            {
+                MessageBox.Show("还没有日志文件。日志目录：" + _dataDir, "ThunderPanSync");
+            }
+        }
+
+        // ================= 工作区夹取（DECISIONS §3.1）=================
+        // MinimumSize 必须乘 Theme.S()，否则高 DPI 下不变大（DarkForm 的
+        // WM_GETMINMAXINFO 是原样直传 this.MinimumSize）；但 150% 下
+        // Theme.S(940)=1410 可能超出屏幕，所以还要夹到工作区。
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            ClampToWorkingArea();
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            // WM_DPICHANGED：运行时换屏 / 改缩放必须重算，否则最小尺寸留在旧档
+            if (m.Msg == 0x02E0) ClampToWorkingArea();
+        }
+
+        private void ClampToWorkingArea()
+        {
+            try
+            {
+                Rectangle wa = Screen.FromControl(this).WorkingArea;   // 物理像素
+                int w = Math.Min(Theme.S(940), wa.Width);
+                int h = Math.Min(Theme.S(700), wa.Height);
+                var want = new Size(w, h);
+                if (MinimumSize != want) MinimumSize = want;
+                if (Width < w || Height < h)
+                    Size = new Size(Math.Max(Width, w), Math.Max(Height, h));
+            }
+            catch { }
+        }
+
+        // P3：两个 WinForms Timer 原来从不 Stop/Dispose。窗体 Dispose 之后它们仍可能
+        // 再 tick 一次，RefreshUiState() 就会碰已释放的控件（跨线程/已释放句柄的隐患）。
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (_tickTimer != null) { try { _tickTimer.Stop(); _tickTimer.Dispose(); } catch (Exception) { } }
+                if (_pollTimer != null) { try { _pollTimer.Stop(); _pollTimer.Dispose(); } catch (Exception) { } }
+            }
+            base.Dispose(disposing);
+        }
+}
+
+    }
+namespace ThunderPanSync
+{
+    /// <summary>
+    /// 界面状态（DECISIONS §五 A-1）。顺序是文档序，不是优先级 ——
+    /// 判定链只有 MainForm.RefreshUiState() 一处。
+    /// </summary>
+    internal enum UiState
+    {
+        Error,
+        Paused,
+        NotConfigured,
+        Running,
+        Ready
+    }
+
+    /// <summary>ComboBox 的一项：显示文本 + 实际取值（字符串，便于回填比较）。</summary>
+    internal sealed class ComboOption
+    {
+        public readonly string Text;
+        public readonly string Value;
+        public ComboOption(string text, string value) { Text = text; Value = value; }
+        public override string ToString() { return Text; }
     }
 }
+

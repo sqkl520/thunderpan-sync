@@ -49,7 +49,10 @@ class SyncEngine extends EventEmitter {
     // 配置防御：拼错的 mode 不能退化成"随便删"。任何非 keep/replace 的值一律按 keep。
     if (this.cfg.versionsMode !== 'replace') this.cfg.versionsMode = 'keep';
     this.remoteFolderId = null;
-    this.state = { uploaded: {}, failed: {}, versions: {} };
+    // unverified = "已上传但云端还没核实"的暂存区（**不是失败**）。
+    // 为什么必须单独一个桶：快照不可用时既不能判成功（会静默丢数据），
+    // 也不能判失败（文件其实已在云端，判失败会重传 → 云端出现 a.txt + a(1).txt）。
+    this.state = { uploaded: {}, failed: {}, versions: {}, unverified: {} };
     this.browser = null;
     this.page = null;
     this.running = false;
@@ -79,6 +82,8 @@ class SyncEngine extends EventEmitter {
           failed: s.failed || {},
           // 老版本 state 没有 versions 字段：补空对象，保证 getStatus() 里字段恒存在
           versions: s.versions || {},
+          // 老版本 state 没有 unverified：补空对象（旧状态里不存在"待认领"这种中间态）
+          unverified: (s.unverified && typeof s.unverified === 'object') ? s.unverified : {},
           lastRun: s.lastRun,
         };
         this.remoteFolderId = s.remoteFolderId || null;
@@ -93,7 +98,7 @@ class SyncEngine extends EventEmitter {
       } catch (e2) {
         this.log('warn', '状态文件损坏且无法备份，将从空状态开始', 'DISK');
       }
-      this.state = { uploaded: {}, failed: {}, versions: {} };
+      this.state = { uploaded: {}, failed: {}, versions: {}, unverified: {} };
       this.remoteFolderId = null;
     }
   }
@@ -110,6 +115,8 @@ class SyncEngine extends EventEmitter {
         uploaded: this.state.uploaded,
         failed: this.state.failed,
         versions: this.state.versions,   // 云端版本审计记录（keep/replace 都要有）
+        // 待认领队列必须落盘：否则重启后第一轮会重传一遍，云端就多出 a(1).txt。
+        unverified: this.state.unverified,
         lastRun: this.state.lastRun,
         remoteFolderId: this.remoteFolderId,
       }, null, 2);
@@ -484,6 +491,18 @@ class SyncEngine extends EventEmitter {
   //      原来的 if/else-if 没有 else 分支 ⇒ 整棵子树被静默丢弃、零日志。
   //   3. 同步递归无深度上限：10 万文件会阻塞事件循环数十秒。
   //   4. 无系统目录防护：用户选 C:\ 会把整个系统盘往云上传。
+  // 跳过日志去重：同一个文件、同一个版本，日志里只出现一次。
+  // 不去重的话，500 个 0 字节文件 × 每 5 分钟一轮 = 一天十几万行，
+  // 真正要看的错误会被自己的噪音埋掉（"说了等于没说"）。
+  // 文件一改（size/mtime 变化）就会重新记一次，用户不会漏掉。
+  _logSkipOnce(full, st, msg) {
+    if (!this._skipLogged) this._skipLogged = new Set();
+    const key = `${full}|${st ? st.size : 0}|${st ? Math.floor(st.mtimeMs) : 0}`;
+    if (this._skipLogged.has(key)) return;
+    this._skipLogged.add(key);
+    this.log('info', msg);
+  }
+
   scan() {
     const out = [];
     const now = Date.now();
@@ -539,9 +558,22 @@ class SyncEngine extends EventEmitter {
               continue;
             }
 
-            if (st.size === 0) { out.push({ full, st, skip: '空文件（云盘不接受 0 字节）', skipCode: 'QUOTA' }); continue; }
+            // 跳过必须留下痕迹：界面从不调用 scan()，所以不写日志 = 用户永远不知道
+            // 这个文件根本没被备份（例如 3 GB 视频超上限时，界面全程显示"失败 0"）。
+            // 只记 info，不升级成 warn：跳过是设计行为，不是出错。
+            if (st.size === 0) {
+              this._logSkipOnce(full, st, `跳过 ${path.basename(full)}（空文件，云盘不接受 0 字节）: ${full}`);
+              out.push({ full, st, skip: '空文件（云盘不接受 0 字节）', skipCode: 'QUOTA' });
+              continue;
+            }
             if (st.size > this.cfg.maxSizeMB * 1024 * 1024) {
-              out.push({ full, st, skip: `超过 ${this.cfg.maxSizeMB} MB 上限`, skipCode: 'QUOTA' }); continue;
+              // 小文件也给人话：不足 1 MB 用 KB 显示，否则会出现"0.0 MB 超过上限 0.001 MB"
+              const sizeTxt = st.size >= 1048576
+                ? `${(st.size / 1048576).toFixed(1)} MB`
+                : `${Math.max(1, Math.round(st.size / 1024))} KB`;
+              this._logSkipOnce(full, st, `跳过 ${path.basename(full)}（${sizeTxt}，超过上限 ${this.cfg.maxSizeMB} MB）: ${full}`);
+              out.push({ full, st, skip: `超过 ${this.cfg.maxSizeMB} MB 上限`, skipCode: 'QUOTA' });
+              continue;
             }
 
             // ---- 稳定性判定（修未来时间戳）----
@@ -654,6 +686,8 @@ class SyncEngine extends EventEmitter {
     // 上传前拍快照：判定成功时只认"新出现的 fileId"，
     // 否则云端已有同名同大小旧文件会被误判成本次成功（静默丢数据）
     const beforeIds = await this._snapshotIds();
+    // 快照列举成功 + 空集 ⇒ 上传前目录确实是空的（不用再探测，也不会白判"未核实"）
+    const snapshotOk = this._lastSnapshotOk === true;
 
     const done = new Promise((resolve) => {
       let settled = false;
@@ -713,18 +747,40 @@ class SyncEngine extends EventEmitter {
     emitProgress('verifying', ctx.bytesDone || 0);
 
     // 无论响应是否拿到，都做一次事实核查（这才是"文件真的上去了"的证据）
-    const verified = await this._verifyRemoteFile(name, item.st.size, beforeIds);
-    if (verified) {
+    const verified = await this._verifyRemoteFile(name, item.st.size, beforeIds, snapshotOk);
+    if (verified.ok === true) {
       return await this._onUploadVerified(item, name, beforeIds, ctx);
     }
 
-    if (res.ok) {
+    // 只有"确认失败"才值得再等一轮重查；"未核实"再查也是白等（快照本身不可用）
+    let verdict = verified;
+    if (verified.ok === false && res.ok) {
       // 浏览器说 200，但云端查不到：可能是刚入库、列表还没刷新。再等一轮。
       await new Promise(r => setTimeout(r, 5000));
-      const again = await this._verifyRemoteFile(name, item.st.size, beforeIds);
-      if (again) {
+      const again = await this._verifyRemoteFile(name, item.st.size, beforeIds, snapshotOk);
+      if (again.ok === true) {
         return await this._onUploadVerified(item, name, beforeIds, ctx, true);
       }
+      verdict = again;
+    }
+
+    // ---- 三态的第三种：未核实（P0 的灵魂）----
+    // 文件很可能已经在云端了。此时既不能记成功（快照不可用时可能把"云盘里本来就有的
+    // 同名同大小旧文件"误认成本次上传 —— 那会静默丢数据），也不能记失败（文件真在云端，
+    // 记失败下一轮会重传，云端就多出 a(1).txt）。所以进 unverified 队列，
+    // 下一轮开始前按"名字 + 大小"认领，认领成功直接转成 uploaded，不重传。
+    if (verdict.ok === null) {
+      this.state.unverified[item.full] = {
+        fp: item.fp,
+        name: name,
+        size: item.st.size,
+        at: new Date().toISOString(),
+        reason: verdict.reason,
+      };
+      delete this.state.failed[item.full];   // 绝不能同时挂在"失败"里，否则界面说失败、下轮又重传
+      this._saveState();
+      this.log('warn', `${name} 已上传但云端未核实（${verdict.reason}），下一轮按名字+大小认领，不会重传`, 'NETWORK');
+      return { ok: null, unverified: true, error: '云端未核实（' + verdict.reason + '）', code: 'UNVERIFIED' };
     }
 
     // 失败分类：拿到 HTTP 状态就按状态分（401/403=AUTH, 429/5xx=限流/网络），
@@ -846,6 +902,10 @@ class SyncEngine extends EventEmitter {
   //   - 分页取全量（最多 20 页 = 4000 项）⇒ 不会漏
   async _snapshotIds() {
     const ids = new Set();
+    // listingOk：这次快照的"列举本身"是否成功（true 且 size===0 ⇒ 上传前目录确实是空的）。
+    // 有了这个标志，_verifyRemoteFile 就不必再靠 _remoteFolderIsEmpty() 去猜
+    // "空集是目录空还是快照失败"，于是"往空文件夹里传第一个文件"不会白判成未核实。
+    let listingOk = true;
     // 同时留下完整的文件对象数组：版本策略要按名字找旧副本，
     // 复用这份快照就不用为每个文件再拉一遍目录（少一半 API 调用，也少一次被限流的机会）。
     let files = null;
@@ -857,6 +917,7 @@ class SyncEngine extends EventEmitter {
         if (token) url += '&page_token=' + encodeURIComponent(token);
         const r = await this._apiGet(url);   // 带 header 缓存，不再每页重截 captcha
         if (!r || r.status !== 200) {
+          listingOk = false;
           this.log('warn', `云端快照第 ${page + 1} 页未取到（HTTP ${r ? r.status : 'n/a'}），旧版本判定将偏保守`,
             r ? this._httpCode(r.status) : 'NETWORK');
           break;
@@ -869,11 +930,13 @@ class SyncEngine extends EventEmitter {
         if (!token) break;
       }
     } catch (e) {
+      listingOk = false;
       this._noteErrCode(this._errCodeOf(e));
       this.log('warn', `云端快照失败: ${e.message}`, this._errCodeOf(e));
     }
     // 快照不完整时置 null：宁可让版本策略退回去重新列举，也不要基于半份快照做删除判断
     this._lastSnapshot = (files && files.length === ids.size) ? files : null;
+    this._lastSnapshotOk = listingOk;
     return ids;
   }
 
@@ -902,7 +965,52 @@ class SyncEngine extends EventEmitter {
 
   // 等待 targetName 对应的、且 id 不在 before 集合里的文件出现
   // 同时校验大小（防止把同名的其他新文件误认成本次的）
-  async _verifyRemoteFile(name, size, beforeIds) {
+  // 认领上一轮"已上传但云端未核实"的文件（P0 的另一半）：
+  //   判据只有一条 —— 云端现在有一个**同名且同大小**的文件。
+  //   不看 id：上传前的 id 快照本来就不可用，这正是当初判"未核实"的原因。
+  //   安全性：只有"上一轮确实把文件交给浏览器上传过"才会进 unverified 队列，
+  //   所以按名字+大小认领不会把"用户自己早就传过的同名同大小旧文件"算成本次成功
+  //   （那种情况本来就已经在 uploaded 里，不会出现在 unverified）。
+  //   认领成功 ⇒ 写进 uploaded ⇒ 下一轮 scan() 按 fp 命中后直接跳过，不会重传。
+  async _claimUnverified() {
+    const pend = this.state.unverified || {};
+    const keys = Object.keys(pend);
+    if (!keys.length) return 0;
+    if (!this.remoteFolderId) return 0;
+    let files = [];
+    try { files = await this._beforeFiles(); } catch (e) { files = []; }
+    if (!files.length) {
+      this.log('info', `${keys.length} 个文件待认领，但本轮列举云端失败，下一轮再试`, 'NETWORK');
+      return 0;
+    }
+    let claimed = 0;
+    for (const full of keys) {
+      const u = pend[full];
+      if (!u) continue;
+      const hit = files.find(f => f && f.name === u.name && Number(f.size) === Number(u.size));
+      if (!hit) {
+        this.log('info', `${u.name} 仍待认领（云端暂未见到同名同大小文件），下一轮再试`);
+        continue;
+      }
+      this.state.uploaded[full] = { fp: u.fp, size: u.size, at: new Date().toISOString() };
+      delete this.state.unverified[full];
+      claimed++;
+      this.log('info', `${u.name} 已按名字+大小认领（云端已有 ${Number(u.size)} 字节），不会重传`);
+    }
+    this._saveState();
+    return claimed;
+  }
+
+  // 三态核查（P0 修复的核心）：
+  //   { ok: true,  reason } = 确认本次新出现（新增 id，或目录本来空）
+  //   { ok: false, reason } = 确认失败（云端明确没有，且列举本身成功）
+  //   { ok: null,  reason } = **无法核实**（快照不可用/列举全失败）—— 既不是成功也不是失败
+  //
+  // 原来只有布尔：快照不可用时返回 false，于是"文件已经传上去了"被判失败，
+  // 下一轮重传 → 云端出现 a.txt + a(1).txt；连续 5 轮还会熔断。
+  // 三态的意义：把"不知道"从"失败"里分出来，交给 unverified 队列下一轮按名字+大小认领，
+  // 既不丢数据（绝不把"不知道"当成功），也不重复上传（也不把它当失败）。
+  async _verifyRemoteFile(name, size, beforeIds, snapshotOk) {
     // 快照无效时**不能**判成功。
     //
     // 这是"静默丢数据"的最后一个入口（红队实测出的）：
@@ -914,22 +1022,34 @@ class SyncEngine extends EventEmitter {
     //
     // 删除侧早就有 `beforeIds.size === 0` 防护（_deleteOldVersions），
     // 核查侧却没有 —— 同一个空集，一个方向安全、另一个方向丢数据。现在对齐。
-    if (!beforeIds || beforeIds.size === 0) {
+    let claimedEmpty = false;
+    if ((!beforeIds || beforeIds.size === 0) && snapshotOk === true) {
+      // 列举成功且返回 0 个文件 ⇒ 上传前目录确实是空的，
+      // 任何同名同大小文件都只可能是刚传上去的（无需再探测，也避免把"第一个文件"白判成未核实）
+      claimedEmpty = true;
+    } else if (!beforeIds || beforeIds.size === 0) {
       // 目录确实是空的时候，快照也会是空集。这时无法区分"目录空"和"快照失败"，
-      // 所以额外查一次：只有确认目录为空，才允许用"新出现"以外的判据。
-      const reallyEmpty = await this._remoteFolderIsEmpty();
-      if (!reallyEmpty) {
-        this.log('warn', `${name} 的云端快照不可用（目录非空），无法确认本次上传是否入库；`
-          + '按"未核实"处理，下一轮会重试（不会误记为已备份）', 'NETWORK');
-        return false;
+      // 所以额外查一次，并且区分三种答案：
+      const emptiness = await this._remoteFolderIsEmpty();
+      if (emptiness === null) {
+        // 连"目录为空吗"都问不出来：快照不可用 + 目录状态未知 ⇒ 未核实
+        return { ok: null, reason: 'snapshot-unavailable' };
       }
+      if (emptiness === false) {
+        // 目录非空，但没有上传前的 id 集合 ⇒ 无法区分"新传的"和"本来就有的同名文件"。
+        // 这正是原来防静默丢数据的理由，必须保留：绝不能在这里判成功。
+        return { ok: null, reason: 'snapshot-unavailable' };
+      }
+      claimedEmpty = true;   // 目录确实为空：同名同大小文件都只可能是刚传上去的
       // 目录确实为空：此时任何同名同大小文件都只可能是刚传上去的
     }
 
+    let listedOk = false;      // 是否至少成功列举过一页（决定"没找到"是"确认没有"还是"查不到"）
+    let lastStatus = null;
     for (let attempt = 0; attempt < 6; attempt++) {
       if (attempt > 0) await new Promise(r => setTimeout(r, 3000));
       try {
-        if (!this.remoteFolderId) return false;
+        if (!this.remoteFolderId) return { ok: false, reason: 'no-folder' };
 
         let token = '';
         let sawPages = 0;
@@ -937,10 +1057,11 @@ class SyncEngine extends EventEmitter {
           let url = API + '/drive/v1/files?parent_id=' + encodeURIComponent(this.remoteFolderId) + '&limit=200';
           if (token) url += '&page_token=' + encodeURIComponent(token);
           const r = await this._apiGet(url);   // 带 header 缓存
-          if (!r || r.status !== 200) break;
+          if (!r || r.status !== 200) { lastStatus = r ? r.status : null; break; }
           const j = await r.json();
           const files = j.files || [];
           sawPages++;
+          listedOk = true;      // 至少有一页列举成功 ⇒ 后面的"没找到"才算"确认没有"
 
           for (const f of files) {
             if (Number(f.size) !== Number(size)) continue;
@@ -954,7 +1075,7 @@ class SyncEngine extends EventEmitter {
               // 这是上传前就存在的旧文件，不能算本次成功
               continue;
             }
-            return true;
+            return { ok: true, reason: claimedEmpty ? 'folder-was-empty' : 'new-id' };
           }
 
           token = j.next_page_token || '';
@@ -968,24 +1089,32 @@ class SyncEngine extends EventEmitter {
         }
       }
     }
-    return false;
+    // 列举成功过但 6 轮都没看到它 ⇒ 确认失败；一次都没列举成功 ⇒ 只是"没查到"，不能判失败
+    if (listedOk) return { ok: false, reason: 'not-found' };
+    return { ok: null, reason: 'list-failed' + (lastStatus ? ('（HTTP ' + lastStatus + '）') : '') };
   }
 
   // 云端目标目录是否确实为空。
   // 用途：区分"目录真的是空的（快照空集是正常的）"与"快照查询失败（空集是假的）"。
   // 只有前者才允许在没有 beforeIds 的情况下判定上传成功。
+  // 返回 true / false / null：
+  //   true  = 确认目录为空
+  //   false = 确认目录非空
+  //   null  = **查不到**（没文件夹 / 请求失败 / 解析失败）—— 不能当成"非空"，也不能当成"空"
+  // 原来把"查不到"也返回 false，于是调用方无法区分"目录非空"和"查询失败"，
+  // 只能一律判失败 —— 那正是 P0（上传成功却判失败、随后重复上传）的成因。
   async _remoteFolderIsEmpty() {
     try {
       if (!this.remoteFolderId) return false;
       const url = API + '/drive/v1/files?parent_id='
         + encodeURIComponent(this.remoteFolderId) + '&limit=1';
       const r = await this._apiGet(url);
-      if (!r || r.status !== 200) return false;
+      if (!r || r.status !== 200) return null;
       const j = await r.json();
       const files = j.files || [];
       return files.length === 0;
     } catch (e) {
-      return false;
+      return null;
     }
   }
 
@@ -1260,7 +1389,8 @@ class SyncEngine extends EventEmitter {
     this._runErrCodes = new Set();
     const t0 = Date.now();
     const runNo = this._runCounter;
-    const stats = { runId, runNo, scanned: 0, uploaded: 0, failed: 0, skipped: 0, errors: [], errorCodes: [] };
+    // unverified：本轮"上传过但云端暂时核实不了"的文件数（不是失败，也不是成功）
+    const stats = { runId, runNo, scanned: 0, uploaded: 0, failed: 0, skipped: 0, unverified: 0, errors: [], errorCodes: [] };
     let fatalCode = null;
     try {
       this._emitProgress({
@@ -1272,6 +1402,13 @@ class SyncEngine extends EventEmitter {
       if (!this.remoteFolderId) await this.ensureRemoteFolder();
       if (!this.remoteFolderId) throw this._err('没有可用的远程文件夹', 'PAGE');
 
+      // 上轮"未核实"的文件先尝试认领：认领成功就不重传、也不计失败。
+      // 必须放在 scan() 之前 —— scan() 会按 state.uploaded 的 fp 过滤，认领晚一步就会重传。
+      stats.unverifiedClaimed = await this._claimUnverified();
+      if (stats.unverifiedClaimed) {
+        this.log('info', `已认领 ${stats.unverifiedClaimed} 个上轮未核实的文件（未重传）`);
+      }
+
       const items = this.scan();
       stats.scanned = items.length;
       const ready = items.filter(i => !i.skip);
@@ -1279,11 +1416,16 @@ class SyncEngine extends EventEmitter {
 
       // 单文件退避：失败 5 次以上的文件不再每轮重试，改为每 10 轮才试一次。
       // 记录的是 nextRetryAt（轮次号），因为轮间隔会随退避变化，用时间戳算不准。
+      //
+      // manual（用户点"立即同步"）必须绕过这条过滤：退避是给自动轮省资源用的，
+      // 而手动按钮的语义是"用我现在的凭据立刻再试一次"。原实现没看 manual，
+      // 于是失败 5 次的文件手动也 attempted=0，界面显示"完成·成功 0 个文件"，
+      // 用户以为修好了，实际一个字节都没传（实测确认过的说谎）。
       const due = [];
       let deferred = 0;
       for (const it of ready) {
         const f = this.state.failed[it.full];
-        if (f && f.count >= 5 && typeof f.nextRetryAt === 'number' && runNo < f.nextRetryAt) {
+        if (!manual && f && f.count >= 5 && typeof f.nextRetryAt === 'number' && runNo < f.nextRetryAt) {
           deferred++;
           continue;
         }
@@ -1346,14 +1488,19 @@ class SyncEngine extends EventEmitter {
           // 单文件最多试 2 次（网络抖动/页面慢时一次失败不代表真失败）。
           // 原来函数内零重试，失败只能等下一轮（60s 后），用户体验是"卡住不动"。
           let r = await this.uploadOne(it, ctx);
-          if (!r.ok) {
+          // 只对"确认失败"重试。unverified（ok===null）绝不能重试 —— 那正是重复上传的来源。
+          if (r.ok === false) {
             this.log('warn', `${nm} 第 1 次失败（${r.error}${r.code ? ' / ' + r.code : ''}），2 秒后重试`, r.code);
             await new Promise(r2 => setTimeout(r2, 2000));
             r = await this.uploadOne(it, ctx);
           }
 
-          if (r.ok) stats.uploaded++;
-          else {
+          if (r.ok === true) stats.uploaded++;
+          else if (r.unverified) {
+            // 未核实 != 失败：单独计数，不计入 failed（否则会触发退避/熔断的误判）
+            stats.unverified = (stats.unverified || 0) + 1;
+            this.log('info', `${nm} 本轮未核实（云端暂时查不到快照），已记入待认领队列`);
+          } else {
             stats.failed++;
             stats.errors.push({ file: it.full, error: r.error, code: r.code || 'UNKNOWN' });
             if (r.code) this._noteErrCode(r.code);
@@ -1388,6 +1535,10 @@ class SyncEngine extends EventEmitter {
     } finally {
       stats.durationMs = Date.now() - t0;
       stats.errorCodes = this._runErrCodes ? [...this._runErrCodes] : [];
+      // 致命错误码必须进 stats：runNow() 只能看到 stats，看不到本函数作用域里的
+      // fatalCode。少了这个字段，致命轮（连不上浏览器：failed=0/uploaded=0）
+      // 会被 runNow 的旧判据当成"成功"，于是解熔断 + 记一条"手动同步成功"。
+      stats.fatalCode = fatalCode || null;
       this.currentRun = null;
       this.state.lastRun = stats;
       this.lastRunAt = Date.now();
@@ -1419,6 +1570,8 @@ class SyncEngine extends EventEmitter {
         // 明确告诉界面本轮有几成成功，界面据此决定说"完成"还是"有失败"
         uploaded: stats.uploaded,
         failed: stats.failed,
+        // 未核实（既不算成功也不算失败）。界面可以不说，但绝不能把它当失败。
+        unverified: stats.unverified || 0,
         // 致命错误码（null = 本轮没有整轮级故障）。
         //
         // 为什么必须带出去（实测确证的严重缺陷）：
@@ -1434,7 +1587,8 @@ class SyncEngine extends EventEmitter {
         errorCodes: stats.errorCodes || [],
       });
       this.emit('run-complete', stats);
-      this.log('info', `[${runId}] 完成: 上传 ${stats.uploaded}, 失败 ${stats.failed}, 跳过 ${stats.skipped}, ${stats.durationMs}ms`);
+      this.log('info', `[${runId}] 完成: 上传 ${stats.uploaded}, 失败 ${stats.failed}, 跳过 ${stats.skipped}`
+        + (stats.unverified ? `, 未核实 ${stats.unverified}` : '') + `, ${stats.durationMs}ms`);
     }
     return stats;
   }
@@ -1551,13 +1705,28 @@ class SyncEngine extends EventEmitter {
     } catch (e) {
       stats = null;
     }
-    const roundFailed = !stats || (stats.failed > 0 && stats.uploaded === 0);
+    // 判据必须覆盖"整轮致命"：致命轮（连不上浏览器/没有远程文件夹）
+    // uploaded=0 且 failed=0，旧判据 (failed>0 && uploaded===0) 对它恒为假
+    // ⇒ 判成功 ⇒ 解熔断 ⇒ 记"手动同步成功" ⇒ 状态条转绿。这是阻断级的界面说谎（C-1）。
+    // 致命码来源有二：runOnce 新导出的 stats.fatalCode（首选），
+    // 以及 errors[] 里"没有 file 字段"的整轮级错误条目（兜底，防旧字段缺失）。
+    const fatal = !stats ? null
+      : (stats.fatalCode
+        || ((stats.errors || []).filter(function (e) { return e && !e.file && e.code; })[0] || {}).code
+        || null);
+    const roundFailed = !stats || fatal !== null || (stats.failed > 0 && stats.uploaded === 0);
     if (roundFailed) {
       // 手动这轮也失败：恢复熔断，不要把用户的"点一下"当成问题已解决
+      // circuitOpen 只保持原状（wasOpen）：手动轮**绝不**自己开启熔断
       this.circuitOpen = wasOpen;
       this.consecutiveFailures = Math.max(savedFailures, this.consecutiveFailures);
+      // 失败必须留痕，无论当前是否处于熔断态。
+      // 原来只有 circuitOpen 为真才写日志 ⇒ "未熔断时手动失败"完全静默，
+      // 用户只看到状态条没变绿，日志里一个字都没有。
       if (this.circuitOpen) {
-        this.log('warn', '手动同步仍然失败，保持暂停状态（自动重试仍关闭）', 'UNKNOWN');
+        this.log('warn', '手动同步仍然失败，保持暂停状态（自动重试仍关闭）', fatal || 'UNKNOWN');
+      } else {
+        this.log('warn', '手动同步失败' + (fatal ? `（${fatal}）` : '') + '，自动重试计划未改变', fatal || 'UNKNOWN');
       }
     } else {
       this.consecutiveFailures = 0;

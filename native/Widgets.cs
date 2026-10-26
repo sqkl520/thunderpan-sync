@@ -186,6 +186,9 @@ namespace ThunderPanSync
                 | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
             BackColor = Theme.BgBar;
             Height = Theme.S(8);
+            // 换掉原生 ProgressBar 之后，"这是个进度条"的语义也跟着丢了，
+            // 屏幕阅读器会把它当成无名面板。这里补回角色（值见 PercentDone/AccessibleObject）。
+            AccessibleRole = AccessibleRole.ProgressBar;
             _anim = new Timer();
             _anim.Interval = 33;   // ~30fps，足够平滑且不吃 CPU
             _anim.Tick += delegate
@@ -202,12 +205,51 @@ namespace ThunderPanSync
             set
             {
                 double v = value;
+                // NaN/Infinity 必须先挡：NaN < 0 和 NaN > 1 都是 false，会原样漏进绘制层，
+                // 而 bytesTotal=0 时 pct = bytesDone/0 正好产出 NaN（Infinity 同理）。
+                // 绘制层再兜一次（Draw.DrawProgress），这里是第一道闸。
+                if (double.IsNaN(v) || double.IsInfinity(v)) v = 0;
                 if (v < 0) v = 0;
                 if (v > 1) v = 1;
                 if (Math.Abs(v - _ratio) < 0.0005) return;
                 _ratio = v;
                 Invalidate();
             }
+        }
+
+        /// <summary>完成百分比（0..100）。由 Ratio 派生，供屏幕阅读器读；写它等价于写 Ratio。</summary>
+        public int PercentDone
+        {
+            get
+            {
+                int p = (int)Math.Round(_ratio * 100.0);
+                if (p < 0) p = 0;
+                if (p > 100) p = 100;
+                return p;
+            }
+            set
+            {
+                int p = value;
+                if (p < 0) p = 0;
+                if (p > 100) p = 100;
+                Ratio = p / 100.0;
+            }
+        }
+
+        // 自绘控件没有原生可访问值：屏幕阅读器只能拿到"进度条"这个角色，读不到百分比。
+        // WinForms 原生 ProgressBar 的 AccessibleObject.Value 就是 "37%" 这种字符串，这里照做。
+        private sealed class ProgressAccessibleObject : Control.ControlAccessibleObject
+        {
+            private readonly FlatProgress _owner;
+
+            public ProgressAccessibleObject(FlatProgress owner) : base(owner) { _owner = owner; }
+
+            public override string Value { get { return _owner.PercentDone.ToString() + "%"; } }
+        }
+
+        protected override AccessibleObject CreateAccessibilityInstance()
+        {
+            return new ProgressAccessibleObject(this);
         }
 
         public bool Indeterminate
@@ -263,6 +305,7 @@ namespace ThunderPanSync
         private string _text = "";
         private Timer _blink;
         private bool _blinkOn = true;
+        private int _pinnedWidth;
 
         public StatusPill()
         {
@@ -287,6 +330,31 @@ namespace ThunderPanSync
             set { if (_state != value) { _state = value; SyncBlink(); Invalidate(); } }
         }
 
+        /// <summary>
+        /// 锁定宽度（&gt;0 生效）：Fit() 不再按文本改写 Width。
+        /// 默认 0 = 保持原来的"按文本自动计算"行为。
+        /// 用途：状态栏里几个胶囊要等宽对齐，而文字长度会随状态变（"备份中"/"已暂停"）。
+        /// </summary>
+        public int PinnedWidth
+        {
+            get { return _pinnedWidth; }
+            set
+            {
+                int v = value;
+                if (v < 0) v = 0;
+                if (v == _pinnedWidth) return;
+                _pinnedWidth = v;
+                if (_pinnedWidth > 0)
+                {
+                    if (Width != _pinnedWidth) Width = _pinnedWidth;   // 立刻生效，不等下一次 Fit
+                }
+                else
+                {
+                    Fit();   // 解除锁定：回到按文本算的宽度
+                }
+            }
+        }
+
         public override string Text
         {
             get { return _text; }
@@ -307,6 +375,12 @@ namespace ThunderPanSync
 
         private void Fit()
         {
+            // 锁宽优先：调用方显式指定了宽度就别再用文本长度盖掉它
+            if (_pinnedWidth > 0)
+            {
+                if (Width != _pinnedWidth) Width = _pinnedWidth;
+                return;
+            }
             // 同 StatChip.Fit：不能用 CreateGraphics（构造期 Handle 未建，
             // 早期版本因此让胶囊宽度为 0，整个控件看不见）。
             int w = TextRenderer.MeasureText(_text, Font, new Size(int.MaxValue, int.MaxValue),
@@ -386,8 +460,7 @@ namespace ThunderPanSync
                         g.FillEllipse(b, ix, iy, iconSize, iconSize);
                         break;
                     case PillKind.Configured:
-                    case PillKind.Error:
-                        // 三角形 = 需要关注（形状本身就是警告符号）
+                        // 实心三角 = 需要关注（形状本身就是警告符号）
                         {
                             Point[] tri = new Point[] {
                                 new Point(ix + iconSize / 2, iy),
@@ -395,6 +468,20 @@ namespace ThunderPanSync
                                 new Point(ix, iy + iconSize),
                             };
                             g.FillPolygon(b, tri);
+                        }
+                        break;
+                    case PillKind.Error:
+                        // 叉号 = 出错。这两个状态颜色相同（都是 Theme.Danger，语义上都属危险），
+                        // 灰度下**像素值完全一样**，所以区别只能靠形状（WCAG 1.4.1 不只靠颜色）：
+                        // 实心三角 vs 两条交叉斜线，8px 尺寸下轮廓不同，肉眼与色盲工具都能分开。
+                        {
+                            // 1.5px 的细笔：8px 见方的图标用 2px 笔画会把叉号糊成一团
+                            int inset = Math.Max(1, iconSize / 8);
+                            using (var xp = new Pen(iconColor, Math.Max(1.2f, Theme.S(1))))
+                            {
+                                g.DrawLine(xp, ix + inset, iy + inset, ix + iconSize - inset, iy + iconSize - inset);
+                                g.DrawLine(xp, ix + iconSize - inset, iy + inset, ix + inset, iy + iconSize - inset);
+                            }
                         }
                         break;
                     case PillKind.Paused:
@@ -428,6 +515,7 @@ namespace ThunderPanSync
         private string _label = "";
         private string _value = "0";
         private Color _valueColor = Theme.TextPrimary;
+        private int _pinnedWidth;
 
         public StatChip()
         {
@@ -456,8 +544,39 @@ namespace ThunderPanSync
             set { _valueColor = value; Invalidate(); }
         }
 
+        /// <summary>
+        /// 锁定宽度（&gt;0 生效）：Fit() 不再按文本改写 Width。
+        /// 默认 0 = 保持原来的"按文本自动计算"行为。用途同 StatusPill：指标胶囊等宽对齐，
+        /// 而 "文件夹 3" → "文件夹 12" 会让自动宽度跳一下。
+        /// </summary>
+        public int PinnedWidth
+        {
+            get { return _pinnedWidth; }
+            set
+            {
+                int v = value;
+                if (v < 0) v = 0;
+                if (v == _pinnedWidth) return;
+                _pinnedWidth = v;
+                if (_pinnedWidth > 0)
+                {
+                    if (Width != _pinnedWidth) Width = _pinnedWidth;
+                }
+                else
+                {
+                    Fit();
+                }
+            }
+        }
+
         private void Fit()
         {
+            // 锁宽优先（同 StatusPill.Fit）
+            if (_pinnedWidth > 0)
+            {
+                if (Width != _pinnedWidth) Width = _pinnedWidth;
+                return;
+            }
             // 构造期 Handle 还没建，CreateGraphics 会失败 —— 但不能直接 return，
             // 否则 Width 永远是 0，放进 FlowLayoutPanel 后控件彻底看不见
             // （实测踩过：4 个指标胶囊全部消失，只剩状态胶囊）。
@@ -657,6 +776,18 @@ namespace ThunderPanSync
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
 
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct CRect
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool GetClientRect(IntPtr h, out CRect r);
+
         public DarkListView()
         {
             View = View.Details;
@@ -669,6 +800,10 @@ namespace ThunderPanSync
             BackColor = Theme.BgInset;
             ForeColor = Theme.TextPrimary;
             Font = Theme.FontBody;
+            // ListView 默认不显示 item tooltip：MainForm._lvFail 给行设了 ToolTipText
+            // （失败原因往往比列宽长），但全项目没有一处打开这个开关，
+            // 所以那些提示从来没显示过。这里一次覆盖 _lvDirs / _lvFail 两个列表。
+            ShowItemToolTips = true;
 
             var il = new ImageList();
             il.ImageSize = new Size(1, Theme.S(26));    // 用 ImageSize 间接把行高拉到 26px
@@ -706,27 +841,71 @@ namespace ThunderPanSync
         }
 
         /// <summary>
-        /// 让最后一列吃掉剩余宽度，使列宽总和 == 客户区宽度。
+        /// 让最后一列吃掉剩余宽度，使列宽总和 == 表头客户区宽度。
         ///
         /// 这不是美观问题，是消除"表头右侧白块"的根因：
         /// 列宽总和小于控件宽度时，右侧那段填充区由 Header 子窗口用系统浅色绘制，
         /// OwnerDraw 覆盖不到，SetWindowTheme 也只是把白变成深灰（仍有色块）。
         /// 列宽填满后根本不产生填充区。实测有效。
+        ///
+        /// 历史 bug（Lead 实测）：原来这里写 `avail = ClientSize.Width`，又在滚动条出现时
+        /// `avail -= Theme.S(18)`。而 **ClientSize.Width 在有垂直滚动条时已经排除了滚动条**，
+        /// 等于同一个 18px 扣了两次：12 项时列宽 951、右侧 18px 白块（324 个白像素）。
+        /// 现在改成取表头子窗口自己的客户区宽度，绕开"ClientSize 含不含滚动条"的歧义。
         /// </summary>
         public void FitColumns()
         {
             if (Columns.Count == 0) return;
-            int avail = ClientSize.Width;
+            int avail = ClientSize.Width;      // 客户区宽度：出现垂直滚动条时**已经**排除了滚动条
             if (avail <= 0) return;
-            // 预留垂直滚动条宽度，否则填满后一出现滚动条就又要横向滚动
-            try { if (Items.Count * Theme.S(26) > ClientSize.Height) avail -= Theme.S(18); }
-            catch (Exception) { }
+
+            // 再用表头子窗口的客户区宽度兜一层（表头比客户区更窄时以表头为准）。
+            //
+            // 为什么不能直接拿表头宽当目标（Lead 原方案，我用探针实测过）：
+            // 出现垂直滚动条时，表头窗口**不会**跟着变窄——实测 客户区 969 / 表头 986，
+            // 多出的 17px 是滚动条上方那条。列画到 986 会被滚动条盖住，
+            // 同时 ListView 认为内容比可视区宽 → **冒出横向滚动条**（探针实测 hscroll=True）。
+            // 所以目标取两者较小值：无滚动条时 = 986（表头填满），有滚动条时 = 969。
+            if (IsHandleCreated)
+            {
+                IntPtr header = IntPtr.Zero;
+                try { header = SendMessage(Handle, LVM_GETHEADER, IntPtr.Zero, IntPtr.Zero); }
+                catch (Exception) { }
+                if (header != IntPtr.Zero)
+                {
+                    CRect rc;
+                    if (GetClientRect(header, out rc))
+                    {
+                        int hw = rc.Right - rc.Left;
+                        if (hw > 0 && hw < avail) avail = hw;
+                    }
+                }
+            }
 
             int others = 0;
             for (int i = 0; i < Columns.Count - 1; i++) others += Columns[i].Width;
             int last = avail - others;
-            if (last > Theme.S(40)) Columns[Columns.Count - 1].Width = last;
+            // 幂等短路：算出来的宽度和当前一样就**不要写**。
+            // 写列宽会走 LVM_SETCOLUMNWIDTH，ListView 每次都重算滚动条并重绘，
+            // 10 秒一次的定时刷新里反复写会闪。宽度没变时直接返回，零副作用。
+            if (last > Theme.S(40) && Columns[Columns.Count - 1].Width != last)
+            {
+                Columns[Columns.Count - 1].Width = last;
+            }
         }
+
+        /// <summary>
+        /// 重新按当前宽度分配列宽（幂等，可以随便反复调用）。
+        /// 为什么需要它：给 Items 加行导致垂直滚动条出现/消失时，ListView **不会**触发
+        /// OnResize（滚动条是子窗口，控件外框尺寸没变），列宽就会停在旧值上。
+        /// 调用方在 FillFailedList / 文件夹列表赋值之后调一次即可；
+        /// 定时刷新（如 10 秒一次的 ApplyStatus）里每次都调也安全：宽度没变时不发任何消息。
+        /// </summary>
+        public void RefreshColumns()
+        {
+            FitColumns();
+        }
+
         protected override void OnDrawColumnHeader(DrawListViewColumnHeaderEventArgs e)
         {
             using (var b = new SolidBrush(Theme.BgSurfaceAlt))
@@ -740,7 +919,7 @@ namespace ThunderPanSync
             var r = e.Bounds;
             r.X += Theme.S(8);
             r.Width -= Theme.S(10);
-            Draw.TextLeft(e.Graphics, e.Header.Text, Theme.FontSmall, r, Theme.TextTertiary);
+            Draw.TextLeft(e.Graphics, e.Header.Text, Theme.FontSmall, r, Theme.TextSecondary);
         }
 
         protected override void OnDrawItem(DrawListViewItemEventArgs e)

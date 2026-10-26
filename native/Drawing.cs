@@ -43,48 +43,6 @@ namespace ThunderPanSync
             return p;
         }
 
-        /// <summary>给控件套上圆角（硬裁剪，锯齿可见）。适合小圆角与纯色块。</summary>
-        internal static void ApplyRoundRegion(Control c, int radius)
-        {
-            if (c == null || c.Width <= 0 || c.Height <= 0) return;
-            try
-            {
-                var old = c.Region;
-                using (var path = RoundRect(new Rectangle(0, 0, c.Width, c.Height), radius))
-                {
-                    c.Region = new Region(path);
-                }
-                if (old != null && old != c.Region) old.Dispose();
-            }
-            catch (Exception)
-            {
-                // Region 设置失败（控件尺寸为 0 等）不应该崩掉界面，退回方角
-            }
-        }
-
-        // ---------------- 胶囊（状态 pill） ----------------
-        /// <summary>画一个胶囊形状态标签。返回实际宽度，便于横排时计算位置。</summary>
-        internal static int DrawPill(Graphics g, int x, int y, int height,
-            string text, Color fg, Color bg, Font font)
-        {
-            if (string.IsNullOrEmpty(text)) return 0;
-            int padX = Theme.S(10);
-            SizeF sz = g.MeasureString(text, font);
-            int w = (int)Math.Ceiling(sz.Width) + padX * 2;
-            var rect = new Rectangle(x, y, w, height);
-
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            using (var path = RoundRect(rect, height / 2))
-            using (var b = new SolidBrush(bg))
-            {
-                g.FillPath(b, path);
-            }
-            TextRenderer.DrawText(g, text, font,
-                new Rectangle(x + padX, y, w - padX * 2, height),
-                fg, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPadding);
-            return w;
-        }
-
         // ---------------- 卡片 ----------------
         /// <summary>画一张卡片（圆角底 + 细边框）。</summary>
         internal static void DrawCard(Graphics g, Rectangle r, Color bg, Color border, int radius)
@@ -122,6 +80,10 @@ namespace ThunderPanSync
                 g.FillPath(b, path);
             }
 
+            // NaN/Infinity 必须显式挡：NaN<0 与 NaN>1 都是 false，上一版会把 NaN 一路带到
+            // (int)Math.Round(r.Width * NaN) —— 结果是 int.MinValue，取反/夹取看着"没事"，
+            // 但 Width*Infinity 会溢出成垃圾值，填充宽度随机。第一道闸在 FlatProgress.Ratio。
+            if (double.IsNaN(ratio) || double.IsInfinity(ratio)) ratio = 0;
             if (ratio < 0) ratio = 0;
             if (ratio > 1) ratio = 1;
 
@@ -167,16 +129,10 @@ namespace ThunderPanSync
                 using (var fillPath = RoundRect(new Rectangle(r.X, r.Y, fillW, r.Height), radius))
                 using (var b = new SolidBrush(fillColor))
                 {
-                    g.FillPath(b, fillRectInto(fillPath, new Rectangle(r.X, r.Y, fillW, r.Height)));
+                    g.FillPath(b, fillPath);
                 }
                 g.Clip = old;
             }
-        }
-
-        // 小工具：确保填充路径对应矩形（保持可读性，避免上面一行过长）
-        private static GraphicsPath fillRectInto(GraphicsPath reuse, Rectangle r)
-        {
-            return reuse;
         }
 
         // ---------------- 分割线 ----------------
@@ -222,22 +178,6 @@ namespace ThunderPanSync
             return TextRenderer.MeasureText(g, s, f,
                 new Size(int.MaxValue, int.MaxValue),
                 TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Width;
-        }
-
-        // ---------------- 双缓冲 ----------------
-        //
-        // 自绘控件必须开双缓冲，否则每次 Invalidate 都闪一下。
-        // WinForms 的 DoubleBuffered 是 protected，外部改不了 ——
-        // 这是必须写自定义控件类（而不是给普通 Panel 挂 Paint 事件）的原因之一。
-        internal static void EnableDoubleBuffer(Control c)
-        {
-            try
-            {
-                var pi = typeof(Control).GetProperty("DoubleBuffered",
-                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-                if (pi != null) pi.SetValue(c, true, null);
-            }
-            catch (Exception) { }
         }
 
         // ---------------- 深色标题栏 ----------------
@@ -364,26 +304,6 @@ namespace ThunderPanSync
             }
             catch (Exception) { }
             return any;
-        }
-
-        /// <summary>给 ListView 套深色（表头 + 滚动条一起处理）。</summary>
-        internal static void DarkenListView(ListView lv)
-        {
-            if (lv == null) return;
-            lv.BackColor = Theme.BgInset;
-            lv.ForeColor = Theme.TextSecondary;
-            // OwnerDraw 后表头颜色可控，但 DrawColumnHeader 必须自己实现，否则表头空白
-            TryDarkScrollbars(lv);
-            try
-            {
-                // 表头背景在用 visual styles 时无法直接改，只能靠 SetWindowTheme 的
-                // "ItemsView" 子主题让系统按深色画。
-                if (lv.IsHandleCreated)
-                {
-                    SetWindowTheme(lv.Handle, "DarkMode_ItemsView", null);
-                }
-            }
-            catch (Exception) { }
         }
 
         // ---------------- 高 DPI ----------------

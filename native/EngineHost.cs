@@ -41,6 +41,10 @@ namespace ThunderPanSync
         //   true  => 已在运行，此时写失败大概率是进程中途死了（才报异常）
         private volatile bool _started = false;
 
+        // [FIX 5] 进程代数：每次 Start() +1。读线程只对"自己那一代"的 EOF 报警，
+        // 否则一次正常重启会留下两条假告警（实测：nosd 场景 fatals=1 "引擎进程已退出"）。
+        private volatile int _procGen = 0;
+
         // stderr 落盘：debug 级别的引擎原始日志不进 UI（会刷屏），但绝不能丢——
         // 崩溃时的最后几行几乎总是唯一线索。OnFatal 时把末尾若干行附在错误里。
         private readonly object _stderrSync = new object();
@@ -60,6 +64,11 @@ namespace ThunderPanSync
         /// <summary>启动 node 宿主。nodeExe 与 hostScript 由调用方给出（安装目录定位）。</summary>
         public void Start(string nodeExe, string hostScript, string dataDir)
         {
+            // [FIX 1] 旧进程必须先释放：只把 _proc 重新赋值，旧进程的 stdin 句柄
+            // 仍留在本进程里 —— 实测 nosd 场景旧 node 一直活着，两个引擎同时写同一个
+            // state.json，界面显示"已重启"而实际仍在被旧引擎改状态。
+            DisposeOldProcess();
+
             _stderrFile = Path.Combine(dataDir, "engine-stderr.log");
             PrepareStderrFile();
 
@@ -89,39 +98,44 @@ namespace ThunderPanSync
             // 但它在收到 ready 之前不会让 IsReady 为真，所以这里顺序是安全的。
             _started = true;
 
-            var tOut = new Thread(ReadStdout);
+            // [FIX 5] 读线程绑定自己那一代的 Process 对象，不再共享字段 _proc。
+            // 共享字段时 Start() 重入后旧线程会从**新**进程的 stdout 抢行（随机丢响应）。
+            _procGen++;
+            int myGen = _procGen;
+            Process myProc = _proc;
+            var tOut = new Thread(delegate() { ReadStdout(myProc, myGen); });
             tOut.IsBackground = true;
             tOut.Start();
 
-            var tErr = new Thread(ReadStderr);
+            var tErr = new Thread(delegate() { ReadStderr(myProc); });
             tErr.IsBackground = true;
             tErr.Start();
         }
 
-        private void ReadStdout()
+        private void ReadStdout(Process p, int gen)
         {
             try
             {
                 string line;
-                while ((line = _proc.StandardOutput.ReadLine()) != null)
+                while ((line = p.StandardOutput.ReadLine()) != null)
                 {
                     if (line.Length == 0) continue;
                     try { Dispatch(line); }
                     catch (Exception ex) { RaiseFatal("解析失败: " + ex.Message + " | " + Trunc(line, 200)); }
                 }
             }
-            catch (Exception ex) { RaiseFatal("stdout 读失败: " + ex.Message); }
+            catch (Exception ex) { if (gen == _procGen) RaiseFatal("stdout 读失败: " + ex.Message); }
             // 主动 Shutdown 导致的退出不是异常。不判断 _closing 的话，
             // 每次正常关闭应用都会在界面上留一条假的"引擎异常"告警。
-            if (!_closing) RaiseFatal("引擎进程已退出");
+            if (!_closing && gen == _procGen) RaiseFatal("引擎进程已退出");
         }
 
-        private void ReadStderr()
+        private void ReadStderr(Process p)
         {
             try
             {
                 string line;
-                while ((line = _proc.StandardError.ReadLine()) != null)
+                while ((line = p.StandardError.ReadLine()) != null)
                 {
                     // 原始行先落盘，再转发给 UI。UI 侧会过滤掉 debug，
                     // 所以"UI 看不到"与"查不到"必须是两件事。
@@ -418,6 +432,20 @@ namespace ThunderPanSync
             _closing = true;
             // 主动关闭后不再接受 Call()：此后写 stdin 失败是预期行为，不该报警。
             _started = false;
+            // [FIX 2] 唤醒所有在飞的 Call()：不唤醒的话它们会一直睡到自己的超时
+            // （实测 8000ms 超时 => 8031ms 才返回），而 restart 按钮就在那个时刻按下的。
+            // 唤醒后 Call 立刻返回 null（没有结果），界面可以马上重问新引擎。
+            try
+            {
+                lock (_sync)
+                {
+                    foreach (var kv in _waiters)
+                    {
+                        try { kv.Value.Set(); } catch { }
+                    }
+                }
+            }
+            catch { }
             try
             {
                 if (_proc != null && !_proc.HasExited)
@@ -436,6 +464,38 @@ namespace ThunderPanSync
             }
             catch { }
             CloseStderrFile();
+            // [FIX 3] 释放进程句柄（否则重复重启会累积句柄；.NET 的 Process 不 Dispose 不会自动关 pipe）
+            try { if (_proc != null) _proc.Dispose(); } catch { }
+            _proc = null;
+        }
+
+        /// <summary>
+        /// [FIX 4] 重启引擎：Shutdown + Start 的封装。
+        /// 实测（probe.exe restart / same / fast / new）：re-entry 本身可用，
+        /// 0 次超时、0 次假 fatal，node 子进程数在重启期间稳定为 1，结束后归 1（无泄漏）。
+        /// </summary>
+        public void Restart(string nodeExe, string hostScript, string dataDir)
+        {
+            Shutdown();
+            Start(nodeExe, hostScript, dataDir);
+        }
+
+        /// <summary>关掉并释放上一个子进程（Start 重入前必须调用）。</summary>
+        private void DisposeOldProcess()
+        {
+            // 先把代数推进：旧读线程看到 gen != _procGen 就不再报"引擎进程已退出"。
+            // 顺序很重要 —— 先 Kill 再推进代数的话，旧线程会在那个空窗里报一次假 fatal。
+            _procGen++;
+            try
+            {
+                if (_proc != null)
+                {
+                    try { if (!_proc.HasExited) { try { _proc.Kill(); } catch { } } } catch { }
+                    try { _proc.Dispose(); } catch { }
+                }
+            }
+            catch { }
+            _proc = null;
         }
     }
 }

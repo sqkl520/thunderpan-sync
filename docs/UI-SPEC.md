@@ -2,6 +2,10 @@
 
 > 这份文档只记录**已经实测验证过的技术事实**和**已确定的设计决策**。
 > 每条事实后面注明验证方式。不要基于"应该可以"去实现。
+>
+> ⚠️ **行号是本轮重构进行中的快照（最后一次核对 2026-10-27 03:50）**，`native\*.cs`
+> 与 `engine.js` 正在被多个 agent 同时改，行号会漂移。**引用代码位置时以函数名/符号为准**，
+> 行号只作辅助。文档里出现"约 L####"的地方都已按此原则重写。
 
 ---
 
@@ -73,6 +77,8 @@
 
 ### 1.7 现有视觉层文件（已编译进产品）
 
+> 下表的行数是**重构开始前**的实测值（2026-10-26）。重构期三个文件同时在改，行数会变，以文件实际内容为准。
+
 | 文件 | 行数 | 内容 |
 |---|---|---|
 | `native/Theme.cs` | 184 | 颜色令牌、字号、间距、`S()` DPI 缩放、`Contrast()` WCAG 计算 |
@@ -81,7 +87,7 @@
 | `native/DarkForm.cs` | 316 | 自绘深色标题栏基类 |
 | `native/UiPreview.cs` | 174 | **开发期自检窗口，不进产品构建**（有独立 Main） |
 
-编译产物：77,312 B（含以上全部）。
+编译产物：**81,920 B**（2026-10-27 03:25 用 `build-native.ps1 -SkipInstaller` 实测；重构期每次改动都会变，别把数字写死到文档/README 的绝对承诺里）。
 
 ### 1.8 配色令牌（`Theme.cs` 已定义，对比度已验证）
 
@@ -106,7 +112,7 @@
 
 ## 二、已确定的信息架构决策
 
-### 2.1 主状态只有 6 个，且必须单一来源
+### 2.1 主状态只有 5 个（原设计 6 个，`LoginRequired` 无数据源已删），且必须单一来源
 
 ```csharp
 internal enum UiState {
@@ -119,10 +125,17 @@ internal enum UiState {
 }
 ```
 
+> **⚠️ 实施口径（2026-10-27 核对）：`LoginRequired` 没有数据源，不实现。**
+> `host.js` 的 `status` 处理器返回 `{config, status, dataDir, configFile, logFile, latestLogPointer, pid}`，
+> 而引擎 `getStatus()` 里**没有 `loggedIn` 字段**——界面无法得知"有目录但未登录"。
+> 因此实际实现是 **5 态**：`Error / Paused / NotConfigured / Running / Ready`，
+> **登录态降级为状态条的副信息**（由 `BrowserManager` 自己的探测结果驱动，不参与 UiState 派生）。
+> 不要为了凑 6 态去猜登录状态：猜错就是"绿着但没备份"的同类缺陷。
+
 优先级从高到低。**所有区域（状态胶囊文案/主按钮/进度区可见性/失败区可见性/托盘 tooltip/托盘菜单）只从 UiState 派生，不许各自 if-else。**
 
 两条硬规则：
-1. **`circuitOpen == true` 时禁止显示绿色、禁止显示进度条**。当前 `ApplyStatus` 里熔断时 `running` 仍为 true 会走"备份中"分支（`MainForm.cs` 约 L1095），这是必须堵死的复发点。
+1. **`circuitOpen == true` 时禁止显示绿色、禁止显示进度条**。当前 `ApplyStatus` 里熔断时 `running` 仍为 true 会走"备份中"分支（`ApplyStatus()` 的 `if (circuitOpen) / else if (running)` 链，2026-10-27 核对时在 `MainForm.cs:1175-1189`），这是必须堵死的复发点。
 2. **不显示引擎没给的数据**。`nextRetryAt` 是**轮次号**不是时间戳（`engine.js:752`），绝不能显示成时间。`pausedReason` 只有固定串，没有原因区分。
 
 ### 2.2 状态条：从 5 个指标收敛为 1 个状态 + 1 行证据
@@ -146,20 +159,28 @@ internal enum UiState {
 
 ### 2.4 按钮：全局唯一 Primary，动词随状态变
 
-| UiState | 主按钮 | 次按钮 |
+| UiState | 主按钮 | 次按钮 | 本轮实施 |
+|---|---|---|---|
+| Error | 重试连接（原「重启引擎」） | 打开日志 | ⚠️ 见下 |
+| NotConfigured | 添加文件夹… | — | 做 |
+| ~~LoginRequired~~ | （态已取消，见 §2.1） | — | 不做 |
+| Paused | 立即同步一次（替代「立即重试一次」） | 查看失败原因 · 关闭自动备份 | 做 |
+| Running | — | 查看详情 | ⚠️ 见下 |
+| Ready | 开始自动备份 | 立即同步一次 | 做 |
+
+**⚠️ 三个按钮本轮做不了 —— 引擎侧没有对应命令**（`host.js` 只有 `status/scan/runOnce/start/stop/saveConfig/connect/quit`）：
+
+| UI-SPEC 原要求 | 现实 | 处置 |
 |---|---|---|
-| Error | 重启引擎 | 打开日志 |
-| NotConfigured | 添加文件夹… | — |
-| LoginRequired | 登录迅雷云盘 | — |
-| Paused | 立即重试一次 | 查看失败原因 · 关闭自动备份 |
-| Running | 取消本轮（secondary） | 查看详情 |
-| Ready | 开始自动备份 | 现在备份一次 |
+| `重启引擎` | 没有 `restart` 命令 | 本轮不做；Error 态的主按钮改为「重试连接」（复用 `connect`），标 v2 |
+| `取消本轮` | 没有 `cancel` 命令；`runOnce` 不可中断 | 本轮不做，标 v2。用户能用的替代是「停止自动备份」，**但文案必须说清它同时关掉自动备份** |
+| `重试这个`（§2.6 失败列表动作） | 没有 `retryFile` 命令 | 本轮不做，标 v2；失败列表整行的动作降级为「立即同步一次」（= 重跑一轮，会重试该文件） |
 
 **`已登录 ✓` 不再是按钮** —— 它是状态。放副行末尾（弱化灰）或未登录时升级为黄色横幅。
 
 ### 2.5 进度：绝不给假速度
 
-**当前 `MainForm.cs` L892-897 的速度算法是假的**：
+**当前速度算法是假的**（`ApplyProgress()` 里 `if (elapsedMs > 500 && bytesDone > 0)` 分支，2026-10-27 核对时在 `MainForm.cs:968-988`）：
 ```csharp
 double bps = (double)bytesDone * 1000.0 / (double)elapsedMs;
 // bytesDone = 本轮其他已完成文件的字节；elapsedMs = 当前文件的耗时
@@ -193,15 +214,21 @@ ETA 按文件数外推，且必须同时满足 `total>=3 && 成功>=2 && 无失�
 | DISK | 读不到文件（被占用/没权限） | 打开所在文件夹 |
 | UNKNOWN | 说不清原因（已记录） | 重试这个 |
 
-**`failedFiles` 只返回前 50 条**（`engine.js:1566`）—— `failedTotal > 50` 时标题必须写「显示前 50 个（共 N 个）」。
+**`failedFiles` 只返回前 50 条**（`getStatus()` 里的 `Object.entries(this.state.failed).slice(0, 50)`，2026-10-27 核对时在 `engine.js:1619`）—— `failedTotal > 50` 时标题必须写「显示前 50 个（共 N 个）」。
 
-### 2.7 删除 TabControl，设置进独立对话框
+### 2.7 保留 Tab，设置留在主窗口内（原方案已否决）
 
-Tab 是"套壳浏览器"观感的第一来源，且原生 `TabControl` 在深色下无法去掉白边。
+**裁决：保留 `SegmentedTabs`（备份 | 设置），不做独立 `SettingsForm` 模态对话框。**
 
-- 主窗口只有"备份"一页
-- 设置 → 独立模态 `SettingsForm`（640×560），入口在底栏右侧「设置」齿轮
-- **主窗口不存在任何"保存"语义**（保存只在设置对话框内）
+否决理由是成本收益：模态窗要新增 ≥150 行代码、多一个 DPI 面（§3.3 的 `Theme.S()` 要在新窗体里重新初始化）、
+多一套"设置改了要不要重启引擎"的状态同步；而收益只是"少一个 Tab 的套壳观感"——
+Tab 已经换成自绘 `SegmentedTabs`（不是原生 `TabControl`，见 `Widgets.cs`），深色下没有白边问题。
+
+- 主窗口两页：`备份` / `设置`，用自绘 `SegmentedTabs` 切换
+- 「保存设置」在主窗口的页内，**只对设置页生效**（不会把当前同步状态写回配置）
+- 底栏不再放设置齿轮（没有独立设置窗）
+
+> 原文"删掉 TabControl，设置进独立模态 `SettingsForm`(640×560)，主窗口不存在任何保存语义"**作废**。
 
 ### 2.8 空状态 = 三步清单 + 唯一 CTA
 

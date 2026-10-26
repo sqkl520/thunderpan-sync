@@ -11,7 +11,9 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-tests.ps1 -UnitOnly
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-tests.ps1 -UploadOnly
 #
-# Exit code: 0 when there is no FAIL (PASS and SKIP are both acceptable),
+# Exit code: 0 when there is no FAIL. SKIP is NOT a pass: it means the case could
+# not be exercised (no browser / no login / timeout) and a human must confirm it.
+# The summary prints a loud warning listing every SKIP.
 #            1 when at least one case FAILs.
 #
 # The heavy lifting lives in two Node scripts next to this file:
@@ -28,7 +30,7 @@ param(
     [switch]$UnitOnly,
     [switch]$UploadOnly,
     [int]$UnitTimeoutSec = 120,
-    [int]$UploadTimeoutSec = 420
+    [int]$UploadTimeoutSec = 900
 )
 
 $ErrorActionPreference = 'Continue'
@@ -326,9 +328,23 @@ $total = $script:results.Count
 Write-Line ''
 Write-Line ('TOTAL=' + $total + ' PASS=' + $passCount + ' FAIL=' + $failCount + ' SKIP=' + $skipCount)
 
+if ($skipCount -gt 0) {
+    Write-Line ''
+    Write-Line ('WARNING: ' + $skipCount + ' case(s) SKIPPED - SKIP is NOT a pass, confirm manually:')
+    for ($i = 0; $i -lt $script:results.Count; $i++) {
+        $r = $script:results[$i]
+        if ($r.Status -eq 'SKIP') { Write-Line ('  - ' + $r.Name + ' : ' + $r.Detail) }
+    }
+}
+
 if ($failCount -gt 0) {
     Write-Line 'RESULT: FAILED'
     exit 1
+}
+
+if ($skipCount -gt 0) {
+    Write-Line ('RESULT: OK-MINUS-SKIPS (no failures, but ' + $skipCount + ' case(s) were skipped and are NOT verified)')
+    exit 0
 }
 
 Write-Line 'RESULT: OK (no failures)'

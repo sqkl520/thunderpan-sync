@@ -29,7 +29,11 @@ const http = require('http');
 const ROOT = path.resolve(__dirname, '..');
 const CDP_PORT = String(process.env.TPS_CDP_PORT || 9222);
 const CDP_URL = 'http://127.0.0.1:' + CDP_PORT;
-const RUN_TIMEOUT_MS = 180000;   // 单轮 runOnce 上限（计划要求 180s）
+// 单轮 runOnce 上限。原来 180s：真机实测一轮"申请票据 45s + 核查 6×3s + 重试"
+// 轻松超过 180s，于是 upload-runonce / upload-idempotent 被记成 SKIP ——
+// 而 SKIP 在报告里看起来和"通过"差不多，等于把"上传其实失败"藏起来了。
+// 600s 才是安静留出余量的上限（外层的进程闸 run-tests.ps1 UploadTimeoutSec 必须更大）。
+const RUN_TIMEOUT_MS = 600000;
 const SMALL_SIZE = 0;            // 占位，实际写入见下
 const BLOB_SIZE = 64 * 1024;
 

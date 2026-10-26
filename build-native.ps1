@@ -61,7 +61,8 @@ $srcs = @(
   'Theme.cs',
   'Drawing.cs',
   'Widgets.cs',
-  'DarkForm.cs'
+  'DarkForm.cs',
+  'FlatCombo.cs'
 ) | ForEach-Object { Join-Path $native $_ }
 foreach ($s in $srcs) { if (-not (Test-Path $s)) { throw "missing source: $s" } }
 

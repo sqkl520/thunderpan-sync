@@ -52,7 +52,12 @@ namespace ThunderPanSync
         // ---------------- 配色：文字层级 ----------------
         internal static readonly Color TextPrimary = Color.FromArgb(235, 238, 242);   // 主要
         internal static readonly Color TextSecondary = Color.FromArgb(168, 176, 188); // 次要
-        internal static readonly Color TextTertiary = Color.FromArgb(124, 132, 144);  // 弱化
+        // 弱化文字。原值 #7C8490 在 BgSurfaceAlt(#262A30) 上只有 3.82:1，低于 WCAG AA 的 4.5:1
+        // （表头 / 设置页提示 / 空闲文案都在用它，属于"承载信息"的文字）。
+        // #8E96A4 是同一色相（冷灰蓝）整体提亮 18 阶的结果：
+        //   BgSurfaceAlt 4.84:1（原 3.82）BgSurface 5.29（4.17）BgBar 5.55（4.38）BgWindow 5.85（4.61）
+        // 注意 BgHover 上仍是 3.90:1 —— 那是悬浮态背景，弱化文字不用它，故不因此再提亮。
+        internal static readonly Color TextTertiary = Color.FromArgb(142, 150, 164);  // 弱化
         internal static readonly Color TextDisabled = Color.FromArgb(92, 98, 108);    // 禁用
         internal static readonly Color TextOnAccent = Color.FromArgb(255, 255, 255);  // 强调色上的字
 
