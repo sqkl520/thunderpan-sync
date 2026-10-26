@@ -288,9 +288,23 @@ namespace ThunderPanSync
                     mmi.ptMaxPosition.Y = mi.rcWork.Top - mi.rcMonitor.Top;
                     mmi.ptMaxSize.X = mi.rcWork.Right - mi.rcWork.Left;
                     mmi.ptMaxSize.Y = mi.rcWork.Bottom - mi.rcWork.Top;
-                    // 最小尺寸也在这里兜一层，避免窗口缩到看不见
-                    mmi.ptMinTrackSize.X = Theme.S(640);
-                    mmi.ptMinTrackSize.Y = Theme.S(420);
+                    // 最小尺寸用窗体自己的 MinimumSize，不要在这里写死。
+                    //
+                    // 原来这里是 Theme.S(640) x Theme.S(420)，实测会**覆盖**
+                    // MainForm.MinimumSize（820x600）—— 向真实窗口发 WM_GETMINMAXINFO
+                    // 读回 ptMinTrackSize 恒为 640x420，不管 MinimumSize 设多少。
+                    // 结果窗口能被拖到比设计更小，布局挤坏。
+                    // 正确做法：有 MinimumSize 就尊重它，没有才用兜底值。
+                    if (MinimumSize.Width > 0 && MinimumSize.Height > 0)
+                    {
+                        mmi.ptMinTrackSize.X = MinimumSize.Width;
+                        mmi.ptMinTrackSize.Y = MinimumSize.Height;
+                    }
+                    else
+                    {
+                        mmi.ptMinTrackSize.X = Theme.S(640);
+                        mmi.ptMinTrackSize.Y = Theme.S(420);
+                    }
                     Marshal.StructureToPtr(mmi, m.LParam, true);
                 }
                 return;

@@ -553,15 +553,27 @@ namespace ThunderPanSync
             }
         }
 
+        // 绘制与命中测试**必须共用同一个宽度函数**。
+        //
+        // 红队实测过这个 bug：OnPaint 用 Draw.MeasureText(g, ...)（走 Graphics/GDI），
+        // TabAt 用静态 TextRenderer.MeasureText（走屏幕 DC），两者宽度差约 9px/字符串。
+        // 结果 tab[0] 画在 0..61 但可点到 0..70；点视觉上属于「设置」的位置会切到「备份」。
+        //
+        // 这是同一根源第二次出事（第一次是 CreateGraphics 导致 Width=0），
+        // 所以固化成一条规则：**同一控件的测量只能有一个来源**。
+        private int TabWidth(int i)
+        {
+            return TextRenderer.MeasureText(_tabs[i], Font, new Size(int.MaxValue, int.MaxValue),
+                TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Width + Theme.S(18) * 2;
+        }
+
         private int TabAt(int x)
         {
             if (_tabs.Length == 0) return -1;
-            int padX = Theme.S(18);
             int cx = 0;
             for (int i = 0; i < _tabs.Length; i++)
             {
-                int w = TextRenderer.MeasureText(_tabs[i], Font, new Size(int.MaxValue, int.MaxValue),
-                    TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Width + padX * 2;
+                int w = TabWidth(i);
                 if (x >= cx && x < cx + w) return i;
                 cx += w;
             }
@@ -595,7 +607,7 @@ namespace ThunderPanSync
 
             for (int i = 0; i < _tabs.Length; i++)
             {
-                int w = Draw.MeasureText(g, _tabs[i], Font) + padX * 2;
+                int w = TabWidth(i);
                 var r = new Rectangle(cx, 0, w, Height);
                 bool sel = (i == _selected);
 

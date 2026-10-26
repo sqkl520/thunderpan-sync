@@ -1077,6 +1077,11 @@ class SyncEngine extends EventEmitter {
       // 只有确实带了才透传，免得旧界面读到 0 会误判"全部失败"
       if (p.uploaded !== undefined && p.uploaded !== null) out.uploaded = Number(p.uploaded);
       if (p.failed !== undefined && p.failed !== null) out.failed = Number(p.failed);
+      // 致命错误码同样必须放行：没有它界面无法区分
+      // "本轮整轮失败（连不上浏览器）" 和 "本轮真的没有文件要传"——
+      // 这两种情况 uploaded/failed 都是 0，界面会把前者说成"完成"（实测确认过）。
+      if (p.fatalCode) out.fatalCode = String(p.fatalCode);
+      if (p.errorCodes && p.errorCodes.length) out.errorCodes = p.errorCodes.slice(0, 8);
       this.emit('progress', out);
     } catch (e) {
       // 事件监听器抛错不能拖垮同步主流程（但也不能静默）
@@ -1414,6 +1419,19 @@ class SyncEngine extends EventEmitter {
         // 明确告诉界面本轮有几成成功，界面据此决定说"完成"还是"有失败"
         uploaded: stats.uploaded,
         failed: stats.failed,
+        // 致命错误码（null = 本轮没有整轮级故障）。
+        //
+        // 为什么必须带出去（实测确证的严重缺陷）：
+        //   致命失败轮与"真的没有文件要传"的成功轮，字段完全一样：
+        //     浏览器连不上: uploaded=0 failed=0 total=0 errors=[{code:'BROWSER'}]
+        //     真的没文件:   uploaded=0 failed=0 total=0 errors=[]
+        //   界面按 failed===0 判定，就把前者显示成
+        //     "完成 · 成功 0 个文件" + 绿色满格进度条
+        //   而实际上一个字节都没传出去 —— 这是本项目历史上最严重的"界面说谎"
+        //   类别里最隐蔽的一种：看起来完全正常，用户看到"完成"就不会再检查。
+        //   带上 fatalCode 后界面才能说"本轮失败：连不上浏览器"。
+        fatalCode: fatalCode || null,
+        errorCodes: stats.errorCodes || [],
       });
       this.emit('run-complete', stats);
       this.log('info', `[${runId}] 完成: 上传 ${stats.uploaded}, 失败 ${stats.failed}, 跳过 ${stats.skipped}, ${stats.durationMs}ms`);

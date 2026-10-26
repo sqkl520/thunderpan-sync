@@ -153,10 +153,20 @@ namespace ThunderPanSync
 
         private static Font MakeFont(string family, float size, FontStyle style)
         {
-            // 字号也要随 DPI 缩放，否则 150% 缩放下字会显得过小
-            float px = size * Scale;
-            try { return new Font(family, px, style, GraphicsUnit.Point); }
-            catch { return new Font(FontFamily.GenericSansSerif, px, style, GraphicsUnit.Point); }
+            // 这里**绝对不能**再乘 Scale。
+            //
+            // GraphicsUnit.Point 的字号天生就是 DPI 无关的：1pt = 1/72 英寸，
+            // GDI+ 会按 DC 的 DPI 自己换算成像素。再乘一次 Scale 就是二次放大。
+            // 红队实测（120/144/192 DPI）：
+            //   应得 20.1px -> 实际 25.1px (1.25x)
+            //   应得 24.1px -> 实际 36.2px (1.50x)
+            //   应得 32.2px -> 实际 64.3px (2.00x)
+            // 而控件高度走 Theme.S() 只放大一次，于是 150% 下文字会溢出被裁。
+            //
+            // 唯一需要 Scale 的是"用像素表示的东西"（高度/间距/圆角），
+            // 字号交给系统换算即可。
+            try { return new Font(family, size, style, GraphicsUnit.Point); }
+            catch { return new Font(FontFamily.GenericSansSerif, size, style, GraphicsUnit.Point); }
         }
 
         // ---------------- 字体可用性探测 ----------------

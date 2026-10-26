@@ -874,50 +874,68 @@ namespace ThunderPanSync
             if (phase == "done")
             {
                 // "完成"这个词必须与实际结果一致。
-                // done 事件里 total = uploaded + failed，若整轮全失败，
-                // 原实现会显示"完成 · 共 10 个文件"——纯属说谎。
+                //
+                // 实测确证过的严重缺陷：致命失败轮与"真的没有文件要传"的成功轮，
+                // uploaded/failed 完全一样（都是 0/0），只靠这两个字段无法区分：
+                //   浏览器连不上 -> uploaded=0 failed=0 total=0
+                //   真的没文件   -> uploaded=0 failed=0 total=0
+                // 老实现按 failed==0 判定，把前者显示成
+                //   "完成 · 成功 0 个文件" + 绿色满格进度条
+                // 而实际一个字节都没传。这是最隐蔽的一类"界面说谎"：
+                // 外观完全正常，用户看到"完成"之后就不会再检查。
+                // 引擎现在会带 fatalCode，必须优先用它。
+                string fatalCode = GetStr(d, "fatalCode", null);
                 int up = GetInt(d, "uploaded", -1);
                 int bad = GetInt(d, "failed", -1);
-                if (up < 0 || bad < 0)
+                bool fatal = !string.IsNullOrEmpty(fatalCode);
+
+                if (fatal)
                 {
-                    // 老引擎没给这两个字段，退回中性措辞，不硬说"完成"
-                    SetProgressIdle("本轮结束 · 共 " + total + " 个文件");
-                }
-                else if (bad == 0)
-                {
-                    SetProgressIdle("完成 · 成功 " + up + " 个文件");
-                }
-                else if (up == 0)
-                {
-                    _lblProgress.Text = "本轮失败 " + bad + " 个文件（详见下方失败列表）";
+                    // 整轮级故障：说清原因，绝不出现"完成"二字
+                    _lblProgress.Text = "本轮失败 · " + FatalCodeText(fatalCode);
                     _lblProgress.ForeColor = Theme.Danger;
-                }
-                else
-                {
-                    _lblProgress.Text = "部分成功 · 成功 " + up + "，失败 " + bad
-                        + "（详见下方失败列表）";
-                    _lblProgress.ForeColor = Theme.Warn;
-                }
-                if (bad == 0)
-                {
-                    try { _progress.Value = 1000; } catch { }
-                    _lblProgress.ForeColor = Theme.Ok;
-                }
-                else if (bad < 0)
-                {
-                    // 老引擎缺字段：不知道成败，就保持中性，既不说成功也不报假失败
-                    try { _progress.Value = 0; } catch { }
-                }
-                else
-                {
-                    // 有失败时进度条不能停在"看起来快完成"的位置，也不能归零装作没事。
-                    // 设成一个明确的"未完成"值并把颜色标红，避免"满格后归零=成功"的误读。
                     try { _progress.Value = Math.Min(_progress.Maximum, 999); } catch { }
-                    try
+                    try { _progress.ForeColor = Theme.Danger; } catch { }
+                }
+                else
+                {
+                    if (up < 0 || bad < 0)
                     {
-                        _progress.ForeColor = Theme.Danger;
+                        // 老引擎没给这两个字段，退回中性措辞，不硬说"完成"
+                        SetProgressIdle("本轮结束 · 共 " + total + " 个文件");
                     }
-                    catch { }
+                    else if (bad == 0)
+                    {
+                        SetProgressIdle("完成 · 成功 " + up + " 个文件");
+                    }
+                    else if (up == 0)
+                    {
+                        _lblProgress.Text = "本轮失败 " + bad + " 个文件（详见下方失败列表）";
+                        _lblProgress.ForeColor = Theme.Danger;
+                    }
+                    else
+                    {
+                        _lblProgress.Text = "部分成功 · 成功 " + up + "，失败 " + bad
+                            + "（详见下方失败列表）";
+                        _lblProgress.ForeColor = Theme.Warn;
+                    }
+                    if (bad == 0)
+                    {
+                        try { _progress.Value = 1000; } catch { }
+                        _lblProgress.ForeColor = Theme.Ok;
+                    }
+                    else if (bad < 0)
+                    {
+                        // 老引擎缺字段：不知道成败，就保持中性，既不说成功也不报假失败
+                        try { _progress.Value = 0; } catch { }
+                    }
+                    else
+                    {
+                        // 有失败时进度条不能停在"看起来快完成"的位置，也不能归零装作没事。
+                        // 设成一个明确的"未完成"值并把颜色标红，避免"满格后归零=成功"的误读。
+                        try { _progress.Value = Math.Min(_progress.Maximum, 999); } catch { }
+                        try { _progress.ForeColor = Theme.Danger; } catch { }
+                    }
                 }
                 return;
             }
@@ -993,6 +1011,18 @@ namespace ThunderPanSync
             }
         }
 
+        /// <summary>把引擎的错误码翻成用户能看懂的一句话。</summary>
+        private static string FatalCodeText(string code)
+        {
+            if (code == "BROWSER") return "后台浏览器没有运行或被关掉了";
+            if (code == "AUTH") return "迅雷登录失效了，请重新登录";
+            if (code == "QUOTA") return "云盘空间不足或文件数超限";
+            if (code == "NETWORK") return "网络连不上云端";
+            if (code == "PAGE") return "云盘网页结构可能变了";
+            if (code == "DISK") return "读不到本地文件（被占用或没有权限）";
+            if (code == "UNKNOWN") return "原因未知（已写入日志）";
+            return "原因未知（" + code + "，已写入日志）";
+        }
         private static string FormatSize(long bytes)
         {
             if (bytes < 1024) return bytes + " B";
