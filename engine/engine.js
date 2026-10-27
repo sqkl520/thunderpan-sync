@@ -496,6 +496,37 @@ class SyncEngine extends EventEmitter {
         this.log('info', `已在 "${name}" 目录`);
         return true;
       }
+
+      // 快路径：页面已经是渲染好的首页（文件列表在），就不要重新导航。
+      //
+      // 为什么要这条：enterRemoteFolder 在**每个文件**上传前都会被调用一次
+      // （uploadOne 里 force=true），外加 ensureRemoteFolder 一次。每次都
+      // goto + 等满重试预算，单次最坏约 53 秒；2 个文件就是 3 次调用 ≈160 秒，
+      // 实测直接把 300 秒的用例看门狗撞掉。而绝大多数情况下页面本来就是好的
+      // （上一个文件刚传完，列表还在），重新导航纯属浪费。
+      const readyNow = await page.evaluate((n) => {
+        return document.readyState === 'complete'
+          && document.querySelectorAll('a[title]').length > 0
+          && !! [...document.querySelectorAll('a[title]')].find(x => x.getAttribute('title') === n);
+      }, name).catch(() => false);
+
+      if (readyNow) {
+        const t = Date.now();
+        const hit = await page.evaluate((n) => {
+          const a = [...document.querySelectorAll('a[title]')].find(x => x.getAttribute('title') === n);
+          if (a) { a.scrollIntoView(); a.click(); return true; }
+          return false;
+        }, name).catch(() => false);
+        if (hit) {
+          await page.waitForTimeout(1500);
+          if ((await crumbsOf()).includes(name)) {
+            this.log('info', `✓ 已进入 "${name}"（页面已就绪，跳过重新导航 ${Date.now() - t}ms）`);
+            return true;
+          }
+        }
+        // 快路径没成：落到下面的完整导航
+      }
+
       await page.goto(PAN + '/', { waitUntil: 'domcontentloaded' }).catch((e) => {
         this.log('warn', `第 ${i} 次导航到迅雷首页失败: ${e.message}`, 'PAGE');
       });

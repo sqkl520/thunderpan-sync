@@ -536,6 +536,15 @@ namespace ThunderPanSync
         /// </summary>
         public void ShutdownBrowser()
         {
+            // 端口缓存必须作废：随机端口模式下，下次启动的浏览器会拿到一个全新端口。
+            // 不重置的话 _portResolved 仍是 true，EnsurePortResolved 直接返回旧端口，
+            // cdp-port.txt 也停在旧值 —— 而 DevToolsActivePort 已经指向新端口。
+            // 实测症状：界面把浏览器起来了（真实端口 10847 可用、有 pan 页面），
+            // 但 cdp-port.txt 还写着上一轮的 8990，引擎连过去必然 ECONNREFUSED。
+            _portResolved = false;
+            _port = 0;
+            try { if (File.Exists(_portFile)) File.Delete(_portFile); } catch { }
+
             try
             {
                 // 1) 优先按我们记录的进程号收掉整棵进程树
