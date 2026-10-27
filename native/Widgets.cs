@@ -680,10 +680,14 @@ namespace ThunderPanSync
         //
         // 这是同一根源第二次出事（第一次是 CreateGraphics 导致 Width=0），
         // 所以固化成一条规则：**同一控件的测量只能有一个来源**。
+        // 左右内缩的唯一来源：盒宽（决定文字居中位置）与选中下划线内缩都必须用它，
+        // 否则会出现"文字按 18 排、下划线按 12 缩"的错位；TabAt() 复用 TabWidth() 故自动跟随。
+        private int PadX { get { return Theme.S(12); } }
+
         private int TabWidth(int i)
         {
             return TextRenderer.MeasureText(_tabs[i], Font, new Size(int.MaxValue, int.MaxValue),
-                TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Width + Theme.S(18) * 2;
+                TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Width + PadX * 2;
         }
 
         private int TabAt(int x)
@@ -720,7 +724,7 @@ namespace ThunderPanSync
             var g = e.Graphics;
             using (var b = new SolidBrush(Theme.BgBar)) g.FillRectangle(b, ClientRectangle);
 
-            int padX = Theme.S(18);
+            int padX = PadX;
             int cx = 0;
             g.SmoothingMode = SmoothingMode.AntiAlias;
 
@@ -917,7 +921,9 @@ namespace ThunderPanSync
                 e.Graphics.DrawLine(p, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
             }
             var r = e.Bounds;
-            r.X += Theme.S(8);
+            // 外沿已由父级 _pageMain.Padding(S(12)) 给到 12；这里只保留 4px 呼吸感 ⇒ 落点 16。
+            // 表头与单元格必须用同一个值，否则两者文字会错开。
+            r.X += Theme.S(4);
             r.Width -= Theme.S(10);
             Draw.TextLeft(e.Graphics, e.Header.Text, Theme.FontSmall, r, Theme.TextSecondary);
         }
@@ -945,7 +951,9 @@ namespace ThunderPanSync
             }
 
             var r = e.Bounds;
-            r.X += Theme.S(8);
+            // 外沿已由父级 _pageMain.Padding(S(12)) 给到 12；这里只保留 4px 呼吸感 ⇒ 落点 16。
+            // 表头与单元格必须用同一个值，否则两者文字会错开。
+            r.X += Theme.S(4);
             r.Width -= Theme.S(10);
 
             Color fg = selected ? Theme.TextPrimary

@@ -750,6 +750,9 @@ namespace ThunderPanSync
             _pageMain.Dock = DockStyle.Fill;
             _pageMain.BackColor = Theme.BgSurface;
             _pageHost.Controls.Add(_pageMain);
+            // 对齐：页体内容与上下四条 bar 共用 Theme.S(12) 网格线。
+            // 只给左右，上下必须 0：失败区 0/44/156 三档与日志区高度依赖垂直方向不被压缩。
+            _pageMain.Padding = new Padding(Theme.S(12), 0, Theme.S(12), 0);
             Panel page = _pageMain;
 
             // 文件夹列表标签（高 26）
@@ -1513,6 +1516,10 @@ namespace ThunderPanSync
             _pageSettings.AutoScroll = true;
             _pageHost.Controls.Add(_pageSettings);
 
+            // 设置页与备份页共用 _pageHost：只修一页会让切标签时整页文字横向跳 S(12)。
+            // _pageSettings 是 AutoScroll=true，只能设 Padding；插包装 Panel 会破坏自滚动区域。
+            _pageSettings.Padding = new Padding(Theme.S(12), 0, Theme.S(12), 0);
+
             // 用 TableLayoutPanel（2 列：标签 / 控件）替掉所有
             // "Location = new Point(20, y)" + "y += 24/40" 的手算：
             // 9.5pt 行高在 100/150/200% 是 19/25/35px，y+=24 在 ≥150% 必然重叠（200% 叠 11px）。
@@ -1881,13 +1888,13 @@ namespace ThunderPanSync
 
             int y = Theme.S(14);
             Draw.TextLeft(g, "还没有监视的文件夹", Theme.FontSubtitle,
-                new Rectangle(Theme.S(12), y, r.Width - Theme.S(24), Theme.S(24)), Theme.TextPrimary);
+                new Rectangle(0, y, r.Width, Theme.S(24)), Theme.TextPrimary);
             y += Theme.S(28);
             Draw.TextLeft(g, "点下面的「添加文件夹…」选一个目录，里面的文件会被自动上传到迅雷云盘。",
-                Theme.FontBody, new Rectangle(Theme.S(12), y, r.Width - Theme.S(24), Theme.S(22)), Theme.TextSecondary);
+                Theme.FontBody, new Rectangle(0, y, r.Width, Theme.S(22)), Theme.TextSecondary);
             y += Theme.S(24);
             Draw.TextLeft(g, "加完文件夹之后，右下角的「开始自动备份」才会变成可点（现在它是灰的，就是因为它需要一个目录）。",
-                Theme.FontBody, new Rectangle(Theme.S(12), y, r.Width - Theme.S(24), Theme.S(22)), Theme.TextTertiary);
+                Theme.FontBody, new Rectangle(0, y, r.Width, Theme.S(22)), Theme.TextTertiary);
         }
 
         private void DoPrimary()
