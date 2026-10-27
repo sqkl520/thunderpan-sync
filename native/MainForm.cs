@@ -135,69 +135,157 @@ namespace ThunderPanSync
         // 沉默地替用户承担这个风险是不诚实的，所以首次运行必须显式确认。
         public const string EulaFileName = "eula-accepted";
 
+        // ---------------- 风险告知的版本化（M1，修 FACTS G1）----------------
+        //
+        // 旧实现只判断 marker 文件是否存在（File.Exists），因此只要文案升级过，
+        // 已经装上的用户就永远看不到新风险 —— 而风险最大的人群恰恰是已经用了
+        // 几个月、已经在本地删过东西的人。这里上三把锁：
+        //   1) EulaVersion   —— 契约：实质改动风险内容就 +1
+        //   2) EulaChanges() —— 人话：这次多了什么（老用户只看这几条，不重读全文）
+        //   3) EulaDigest()  —— 兜底：改了内容却忘了升版本时，指纹不一致也会重弹
+        public const int EulaVersion = 2;
+
+        // 正文必须极短：实测 516 汉字需要 103 秒才能读完，而用户只给 30 秒（约 100 汉字）。
+        // 所以这里只留"最坏后果"和"怎么自保"两件事；详细条款在 EULA.txt 与安装页。
+        // 当前 120 汉字（改完必须重新数，见 work\disclose 的验收表 V1）。
         public static string EulaText(string dataDir)
         {
             if (string.IsNullOrEmpty(dataDir))
                 dataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ThunderPanSync");
             var sb = new StringBuilder();
-            sb.AppendLine("在使用 ThunderPanSync 之前，请如实读完以下内容。");
+            sb.AppendLine("非官方工具，驱动迅雷网页版上传，可能违反《迅雷网盘服务协议》3.12、3.4.3 条。");
+            sb.AppendLine("最坏：封号后迅雷有权永久删除云盘全部文件，含你以前传的（2.8 条）。");
+            sb.AppendLine("只能上传，不能下载或恢复。");
+            sb.AppendLine("调试端口仅 127.0.0.1、无认证，运行期一直开放。");
+            sb.AppendLine("建议注册专用迅雷小号再用，被封只损失小号。");
+            sb.AppendLine("免费按现状提供，不保证能用，作者不担损失。");
             sb.AppendLine();
-            sb.AppendLine("1) 工作原理与协议风险");
-            sb.AppendLine("   本工具不是迅雷官方软件。它会在本机后台运行一个浏览器，");
-            sb.AppendLine("   通过 Chrome DevTools Protocol（CDP）读取迅雷网页版页面里的");
-            sb.AppendLine("   captcha 计算结果与登录 token（sessionid 等），再用这些凭证");
-            sb.AppendLine("   调用迅雷云盘的网页接口上传文件。");
-            sb.AppendLine("   这种自动化方式不在迅雷官方支持范围内，可能违反《迅雷用户协议》。");
-            sb.AppendLine();
-            sb.AppendLine("2) 账号风险");
-            sb.AppendLine("   因为存在上述非官方自动化行为，你的迅雷账号存在被限速、");
-            sb.AppendLine("   被限制功能、甚至被封禁的可能。这个风险由你自行承担。");
-            sb.AppendLine();
-            sb.AppendLine("3) 没有恢复功能（重要）");
-            sb.AppendLine("   本工具只做「本地上传到云盘」这一个方向。");
-            sb.AppendLine("   它没有下载/恢复功能，不能把云盘上的文件取回本地。");
-            sb.AppendLine("   云盘不是备份的唯一副本，请务必保留你自己的本地原文件。");
-            sb.AppendLine();
-            sb.AppendLine("4) 本机安全风险：调试端口无认证");
-            sb.AppendLine("   本工具会在本机启动一个带远程调试端口的浏览器（独立 profile），");
-            sb.AppendLine("   默认端口 127.0.0.1:9222；若该端口已被其他程序占用，");
-            sb.AppendLine("   会自动改用 9223-9233 中的空闲端口（实际端口记录在数据目录）。");
-            sb.AppendLine("   该端口没有认证：任何能在本机运行的程序都可以连上去，");
-            sb.AppendLine("   接管这个已登录迅雷账号的浏览器会话。");
-            sb.AppendLine("   请勿在不受信任的电脑上使用本工具。");
-            sb.AppendLine();
-            sb.AppendLine("5) 退出与卸载");
-            sb.AppendLine("   退出程序时只会终止「命令行里含本工具 profile 路径」的浏览器进程，");
-            sb.AppendLine("   不会影响你自己日常使用的浏览器。");
-            sb.AppendLine("   卸载时会询问是否删除配置目录，默认保留（选「否」）；");
-            sb.AppendLine("   云盘上已经上传的文件不会因卸载而被删除。");
-            sb.AppendLine();
-            sb.AppendLine("6) 数据与日志");
-            sb.AppendLine("   配置、登录态（独立浏览器 profile）、运行日志都存放在：");
-            sb.AppendLine("   " + dataDir);
-            sb.AppendLine("   日志按天分文件（sync-YYYY-MM-DD.log）。");
-            sb.AppendLine();
-            sb.AppendLine("点击「我已了解并承担风险」表示你已阅读、理解并接受以上全部内容。");
+            sb.AppendLine("EULA.txt · 告知版本 v" + EulaVersion + " · " + dataDir);
             return sb.ToString();
         }
 
-        /// <summary>eula-accepted 不存在则弹模态对话框；返回 false 表示用户选择退出。</summary>
+        /// <summary>正文指纹（FNV-1a 32 位，8 位十六进制）：兜底"改了内容却忘了升版本"。</summary>
+        public static string EulaDigest()
+        {
+            string text = EulaText(null);      // null ⇒ 固定占位路径，避免每台机器指纹不同
+            uint h = 2166136261u;
+            byte[] b = Encoding.UTF8.GetBytes(text);
+            for (int i = 0; i < b.Length; i++)
+            {
+                h = h ^ b[i];
+                h = h * 16777619u;
+            }
+            return h.ToString("x8");
+        }
+
+        /// <summary>这一版比上一版多了什么（升级弹窗只显示这些，不重读全文）。</summary>
+        private static string[] EulaChanges()
+        {
+            return new string[] {
+                "协议名写准了：《迅雷网盘服务协议》，命中第 3.12 条（未授权衍生软件）与第 3.4.3 条。",
+                "写明最坏后果：封号后迅雷有权永久删除云盘里的全部文件，含你以前手动传的（2.8 条）。",
+                "新增建议：改用专用迅雷小号 —— 被封只损失小号，不连累你攒了几年的主号。",
+                "新增说明：调试端口只在 127.0.0.1、没有认证、应用运行期间一直开放。",
+            };
+        }
+
+        /// <summary>把 fromVersion 之后的变更拼成给用户看的几行字。</summary>
+        private static string EulaDiffText(int fromVersion)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("你在旧版本里确认过风险须知 v" + fromVersion + "。");
+            sb.AppendLine("这次只改了下面这些，其余条款一字未动，不用重读。");
+            sb.AppendLine();
+            string[] cs = EulaChanges();
+            for (int i = 0; i < cs.Length; i++) sb.AppendLine("  · " + cs[i]);
+            sb.AppendLine();
+            sb.AppendLine("点下面的按钮 = 你接受更新后的全部内容。（告知版本 v" + EulaVersion + "）");
+            return sb.ToString();
+        }
+
+        /// <summary>读 eula-accepted：解析 "(eula vN sha=xxxx)"；老格式 "(eula v1)" 也能认。</summary>
+        private static bool ReadEulaMark(string dataDir, out int version, out string sha)
+        {
+            version = 0;
+            sha = "";
+            try
+            {
+                var p = Path.Combine(dataDir, EulaFileName);
+                if (!File.Exists(p)) return false;         // 没接受过
+                string raw = File.ReadAllText(p);
+                int a = raw.IndexOf("(eula v", StringComparison.Ordinal);
+                if (a >= 0)
+                {
+                    int j = a + 7;
+                    int k = j;
+                    while (k < raw.Length && raw[k] >= '0' && raw[k] <= '9') k++;
+                    if (k > j)
+                    {
+                        int v;
+                        if (int.TryParse(raw.Substring(j, k - j), out v)) version = v;
+                    }
+                }
+                int b = raw.IndexOf("sha=", StringComparison.Ordinal);
+                if (b >= 0)
+                {
+                    int j2 = b + 4;
+                    int k2 = j2;
+                    while (k2 < raw.Length && ((raw[k2] >= '0' && raw[k2] <= '9') || (raw[k2] >= 'a' && raw[k2] <= 'f'))) k2++;
+                    sha = raw.Substring(j2, k2 - j2);
+                }
+                return true;                                // 存在但解析不出 ⇒ version=0，按"需要重看"处理
+            }
+            catch { return false; }                          // 读不出来 = 当作没接受过（fail-closed 方向）
+        }
+
+        private static void WriteEulaMark(string dataDir, int version, string sha)
+        {
+            // 写失败不拦人（下次会再问一遍）—— 与旧实现语义一致
+            try
+            {
+                Directory.CreateDirectory(dataDir);
+                var enc = new UTF8Encoding(true);   // 带 BOM，记事本打开不乱码
+                File.WriteAllText(Path.Combine(dataDir, EulaFileName),
+                    "accepted " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+                    + " (eula v" + version + " sha=" + sha + ")" + Environment.NewLine,
+                    enc);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 判定要不要重新告知：不弹窗、不写盘（纯判断）。
+        /// 返回 0 = 不用弹（已接受当前版本）；1 = 首次；2 = 版本/内容有更新。
+        /// </summary>
+        public static int EulaNeed(string dataDir, out int fromVersion, out string why)
+        {
+            fromVersion = 0;
+            why = "";
+            int ver;
+            string sha;
+            bool exists = ReadEulaMark(dataDir, out ver, out sha);
+            if (!exists) { why = "首次使用"; return 1; }
+            if (ver <= 0) { why = "标记文件无法解析"; return 1; }
+            if (ver > EulaVersion) { why = "已接受更高版本 v" + ver; return 0; }
+            fromVersion = ver;
+            if (ver < EulaVersion) { why = "须知从 v" + ver + " 升到 v" + EulaVersion; return 2; }
+            string want = EulaDigest();
+            if (sha.Length > 0 && sha != want) { why = "版本相同但正文变了"; return 2; }
+            why = "已接受";
+            return 0;
+        }
+
+        /// <summary>需要时弹告知窗；返回 false = 用户选择退出（调用方必须据此不启动）。</summary>
         public static bool EnsureEulaAccepted(string dataDir)
         {
             try
             {
-                var mark = Path.Combine(dataDir, EulaFileName);
-                if (File.Exists(mark)) return true;
-                if (!ShowEulaDialog(dataDir)) return false;
-                try
-                {
-                    Directory.CreateDirectory(dataDir);
-                    var enc = new UTF8Encoding(true);   // 带 BOM，记事本打开不乱码
-                    File.WriteAllText(mark,
-                        "accepted " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " (eula v1)" + Environment.NewLine,
-                        enc);
-                }
-                catch { }   // 写不进去也不能因此拦住用户（下次会再问一遍）
+                int fromVersion;
+                string why;
+                int need = EulaNeed(dataDir, out fromVersion, out why);
+                if (need == 0) return true;
+                if (!ShowEulaDialog(dataDir, need == 2 ? fromVersion : 0)) return false;
+                WriteEulaMark(dataDir, EulaVersion, EulaDigest());
                 return true;
             }
             catch
@@ -211,16 +299,25 @@ namespace ThunderPanSync
             }
         }
 
-        private static bool ShowEulaDialog(string dataDir)
+        /// <summary>
+        /// 告知窗。fromVersion = 0 ⇒ 首次（全文）；&gt;= 1 ⇒ 升级（只讲这次变了什么）。
+        /// 两种形态都要求用户**输入 4 个字**才能点继续（动作门）：
+        /// 一键即同意实测 30 秒点完（阅读率约 18%），打字是唯一能把"看到"变成"读过"的廉价手段。
+        /// </summary>
+        private static bool ShowEulaDialog(string dataDir, int fromVersion)
         {
+            bool upgrade = fromVersion >= 1;
+            string gateWord = "我知道";
             using (var f = new Form())
             {
-                f.Text = "ThunderPanSync · 首次使用须知（请务必阅读）";
+                f.Text = upgrade
+                    ? "ThunderPanSync · 风险告知已更新（v" + fromVersion + " → v" + EulaVersion + "）"
+                    : "ThunderPanSync · 首次使用须知（请务必阅读）";
                 f.Width = Theme.S(760);
-                f.Height = Theme.S(620);
-                f.MinimumSize = new Size(Theme.S(600), Theme.S(480));
+                f.Height = Theme.S(600);
+                f.MinimumSize = new Size(Theme.S(600), Theme.S(460));
                 f.StartPosition = FormStartPosition.CenterScreen;
-                f.BackColor = Theme.BgSurface;
+                f.BackColor = Theme.BgSurface;          // Danger/Warn 只画在 BgSurface 上（BgSurfaceAlt 对比度不够）
                 f.ForeColor = Theme.TextPrimary;
                 f.FormBorderStyle = FormBorderStyle.Sizable;
                 f.MaximizeBox = false;
@@ -229,26 +326,44 @@ namespace ThunderPanSync
 
                 var bottom = new Panel();
                 bottom.Dock = DockStyle.Bottom;
-                bottom.Height = Theme.S(56);
+                bottom.Height = Theme.S(104);
                 bottom.BackColor = Theme.BgBar;
-                // EULA 底栏 padY 10：内容 36 >= 原生 Button 32（ADDENDUM 第 5 条）
                 bottom.Padding = new Padding(Theme.S(12), Theme.S(10), Theme.S(12), Theme.S(10));
                 f.Controls.Add(bottom);
 
+                var lblGate = new Label();
+                lblGate.Text = "请在右侧输入「" + gateWord + "」才能继续（防止一键点过）：";
+                lblGate.AutoSize = true;
+                lblGate.Font = new Font("Microsoft YaHei UI", 9.5F);
+                lblGate.ForeColor = Theme.TextPrimary;
+                lblGate.Location = new Point(Theme.S(12), Theme.S(16));
+                bottom.Controls.Add(lblGate);
+
+                var txtGate = new TextBox();
+                txtGate.Width = Theme.S(120);
+                txtGate.Height = Theme.S(24);
+                txtGate.Font = new Font("Microsoft YaHei UI", 9.5F);
+                txtGate.BackColor = Theme.BgInset;
+                txtGate.ForeColor = Theme.TextPrimary;
+                txtGate.BorderStyle = BorderStyle.FixedSingle;
+                txtGate.Location = new Point(Theme.S(12) + lblGate.PreferredWidth + Theme.S(6), Theme.S(12));
+                bottom.Controls.Add(txtGate);
+
                 var btnAccept = new Button();
-                btnAccept.Text = "我已了解并承担风险";
-                btnAccept.Width = Theme.S(200);
+                btnAccept.Text = upgrade ? "我已知晓，继续使用" : "我已了解并承担风险";
+                btnAccept.Width = Theme.S(upgrade ? 170 : 200);
                 btnAccept.Height = Theme.S(32);
                 btnAccept.FlatStyle = FlatStyle.Flat;
                 btnAccept.BackColor = Theme.BgSurfaceAlt;
                 btnAccept.ForeColor = Theme.TextPrimary;
                 btnAccept.FlatAppearance.BorderColor = Color.FromArgb(70, 75, 82);
                 btnAccept.DialogResult = DialogResult.OK;
-                btnAccept.Location = new Point(Theme.S(12), Theme.S(10));
+                btnAccept.Enabled = false;              // 动作门：没输入之前点不动
+                btnAccept.Location = new Point(Theme.S(12), Theme.S(58));
                 bottom.Controls.Add(btnAccept);
 
                 var btnQuit = new Button();
-                btnQuit.Text = "退出";
+                btnQuit.Text = upgrade ? "退出程序" : "退出";
                 btnQuit.Width = Theme.S(110);
                 btnQuit.Height = Theme.S(32);
                 btnQuit.FlatStyle = FlatStyle.Flat;
@@ -256,7 +371,7 @@ namespace ThunderPanSync
                 btnQuit.ForeColor = Theme.TextPrimary;
                 btnQuit.FlatAppearance.BorderColor = Color.FromArgb(70, 75, 82);
                 btnQuit.DialogResult = DialogResult.Cancel;
-                btnQuit.Location = new Point(Theme.S(224), Theme.S(10));
+                btnQuit.Location = new Point(Theme.S(12) + btnAccept.Width + Theme.S(8), Theme.S(58));
                 bottom.Controls.Add(btnQuit);
 
                 var txt = new TextBox();
@@ -269,11 +384,41 @@ namespace ThunderPanSync
                 txt.ForeColor = Color.FromArgb(214, 220, 228);
                 txt.Font = new Font("Microsoft YaHei UI", 9.5F);
                 txt.BorderStyle = BorderStyle.None;
-                txt.Text = EulaText(dataDir);
+                txt.Text = upgrade ? EulaDiffText(fromVersion) : EulaText(dataDir);
                 // 只读文本框里让内容从顶部开始显示
                 txt.SelectionStart = 0;
                 txt.SelectionLength = 0;
+                txt.HandleCreated += delegate { Draw.TryDarkScrollbars(txt); };
                 f.Controls.Add(txt);
+                f.Controls.SetChildIndex(txt, 0);
+
+                var btnFull = new Button();
+                btnFull.Text = "查看完整文本";
+                btnFull.Width = Theme.S(120);
+                btnFull.Height = Theme.S(32);
+                btnFull.FlatStyle = FlatStyle.Flat;
+                btnFull.BackColor = Theme.BgSurfaceAlt;
+                btnFull.ForeColor = Theme.TextPrimary;
+                btnFull.FlatAppearance.BorderColor = Color.FromArgb(70, 75, 82);
+                btnFull.Location = new Point(Theme.S(12) + btnAccept.Width + Theme.S(8) + btnQuit.Width + Theme.S(8), Theme.S(58));
+                btnFull.Visible = upgrade;              // 升级态可以展开全文核对
+                bottom.Controls.Add(btnFull);
+
+                bool showingFull = false;
+                btnFull.Click += delegate
+                {
+                    showingFull = !showingFull;
+                    txt.Text = (showingFull || !upgrade) ? EulaText(dataDir) : EulaDiffText(fromVersion);
+                    btnFull.Text = showingFull ? "只看本次变更" : "查看完整文本";
+                    txt.SelectionStart = 0;
+                    txt.SelectionLength = 0;
+                };
+
+                // 输入框内容决定主按钮是否可用（严格相等：复制粘贴整句没用，必须自己打这 4 个字）
+                txtGate.TextChanged += delegate
+                {
+                    btnAccept.Enabled = string.Equals(txtGate.Text.Trim(), gateWord, StringComparison.Ordinal);
+                };
 
                 // 关窗口 = 退出（不能默认当同意）
                 f.AcceptButton = btnAccept;
@@ -465,21 +610,23 @@ namespace ThunderPanSync
             flow.BackColor = Theme.BgBar;
             _honestyBar.Controls.Add(flow);
 
+            // M6：合并成一句。原来只讲"没有恢复"，用户读成"废话"，而最重的后果
+            // （封号会连累整个云盘）在常驻面上一字未提（红队 M3：四处 0 命中）。
+            // 前半句=能力边界（正文色），后半句=最重后果（Warn）；字号=正文 9.5F，不许用 9pt 灰（灰=藏）。
             _lblHonesty = new Label();
-            _lblHonesty.Text = "只上传，不能下载或恢复";
+            _lblHonesty.Text = "只上传不能恢复";
             _lblHonesty.AutoSize = true;
-            _lblHonesty.Font = new Font("Microsoft YaHei UI", 9F);
-            // 关键短语用 Warn：BgBar #1C1F24 上实测 8.39:1，过 AA
-            _lblHonesty.ForeColor = Theme.Warn;
+            _lblHonesty.Font = new Font("Microsoft YaHei UI", 9.5F);
+            _lblHonesty.ForeColor = Theme.TextPrimary;
             _lblHonesty.Margin = new Padding(0, Theme.S(3), 0, 0);
             flow.Controls.Add(_lblHonesty);
 
             _lblHonestyTail = new Label();
-            _lblHonestyTail.Text = " · 云端不是唯一副本，本地文件请自行保留";
+            _lblHonestyTail.Text = " · 封号会连整个云盘一起没";
             _lblHonestyTail.AutoSize = true;
-            _lblHonestyTail.Font = new Font("Microsoft YaHei UI", 9F);
-            // 正文 TextSecondary：同一背景 7.56:1
-            _lblHonestyTail.ForeColor = Theme.TextSecondary;
+            _lblHonestyTail.Font = new Font("Microsoft YaHei UI", 9.5F);
+            // Warn：BgBar #1C1F24 上实测 8.39:1，过 AA。这条必须一直醒目（见 ApplyStatus）。
+            _lblHonestyTail.ForeColor = Theme.Warn;
             _lblHonestyTail.Margin = new Padding(0, Theme.S(3), 0, 0);
             flow.Controls.Add(_lblHonestyTail);
         }
@@ -1616,13 +1763,14 @@ namespace ThunderPanSync
                 if (_progressRow.Visible != showProgress) _progressRow.Visible = showProgress;
             }
 
-            // 诚实性常驻条：只在 Running 态降级为单色（那正是用户最可能
-            // 误以为"备份=可恢复"的时刻，其余态加强提示）
+            // 诚实性常驻条：Running 态也要让"封号会连整个云盘一起没"保持 Warn。
+            // 旧实现恰在 Running 时把它降成 TextSecondary —— 而那正是用户最可能
+            // 误以为"传完了 = 可以删本地了"的时刻，把警告调暗的方向是反的（Lead 追加必修）。
             if (_lblHonesty != null)
             {
                 bool running = (s == UiState.Running);
-                _lblHonesty.ForeColor = running ? Theme.TextSecondary : Theme.Warn;
-                _lblHonestyTail.ForeColor = Theme.TextSecondary;
+                _lblHonesty.ForeColor = running ? Theme.TextSecondary : Theme.TextPrimary;
+                _lblHonestyTail.ForeColor = Theme.Warn;
             }
 
             ResolvePrimaryAction();

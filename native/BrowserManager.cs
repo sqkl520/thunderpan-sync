@@ -61,7 +61,7 @@ namespace ThunderPanSync
             _dataDir = dataDir;
             _portFile = Path.Combine(dataDir, PortFileName);
             _log = log;
-            _port = DefaultPort;
+            _port = 0;                  // 0 = 还没有浏览器；真正端口在启动后从 DevToolsActivePort 读
         }
 
         /// <summary>实际使用的调试端口（首次访问时解析，并写入 cdp-port.txt）。</summary>
@@ -97,22 +97,31 @@ namespace ThunderPanSync
             lock (_portLock)
             {
                 if (_portResolved) return;
-                int chosen;
-                try { chosen = ResolvePort(); }
-                catch { chosen = DefaultPort; }
+                int chosen = 0;
+                try { chosen = ResolvePort(); } catch { chosen = 0; }
                 _port = chosen;
                 _portResolved = true;
-                // 无论最终是不是 9222 都写：engine 侧与界面侧必须看到同一个端口。
-                // （engine/cdp.js 在文件缺失/内容非法时回退 9222，所以删掉这个文件也能跑）
-                WritePortFile(chosen);
+                if (chosen > 0)
+                {
+                    // engine 侧与界面侧必须看到同一个端口
+                    WritePortFile(chosen);
+                }
+                else
+                {
+                    // 没有可沿用的浏览器：删掉上一次遗留的端口文件，免得引擎去连一个已死的端口
+                    try { if (File.Exists(_portFile)) File.Delete(_portFile); } catch { }
+                }
             }
         }
 
         /// <summary>
-        /// 决定用哪个端口。判断顺序：
-        ///   1. 本应用 profile 上次实际绑定的端口（Edge 可能还活着，绝不能另起同 profile 的实例）
-        ///   2. 默认 9222（空着 → 用它；人家已经在跑真浏览器且是"能用的浏览器"→ 复用）
-        ///   3. 9222 被本应用以外的程序占用 → 9223..9233 第一个空闲端口
+        /// 只做一件事：本应用 profile 的浏览器还活着，就沿用它的端口。
+        /// 返回 0 = 没有可复用的浏览器，启动时用 --remote-debugging-port=0 让浏览器随机分配。
+        ///
+        /// 为什么不再用固定 9222 / 9223-9233（M7，评审认定）：
+        ///   固定端口可被猜、可被抢占冒充 —— 那条攻击链实测能造成"静默丢数据"
+        ///   （别人在 9222 上放一个假 CDP，本应用连上去后会把"云端已有该文件"当真的）。
+        ///   随机化之后，端口只存在于 browser-profile\DevToolsActivePort 与 cdp-port.txt 里。
         /// </summary>
         private int ResolvePort()
         {
@@ -120,7 +129,6 @@ namespace ThunderPanSync
             string ownWs;
             ReadDevToolsActivePort(out ownPort, out ownWs);
 
-            // ---- 1) 沿用本应用 profile 上次的端口 ----
             if (ownPort > 0)
             {
                 var own = ProbePort(ownPort);
@@ -128,37 +136,58 @@ namespace ThunderPanSync
                 // 或者它已经在提供 pan.xunlei.com 页面 —— 两种情况都可以放心复用
                 if (own.IsBrowser && (IsOwnEndpoint(own, ownWs) || own.HasPanPage))
                 {
-                    if (ownPort != DefaultPort)
-                        _log("沿用本应用上次使用的调试端口 " + ownPort);
+                    _log("沿用本应用上次使用的调试端口 " + ownPort);
                     return ownPort;
                 }
+                return 0;
             }
 
-            // ---- 2) 默认端口 ----
-            var d = ProbePort(DefaultPort);
-            if (!d.Reachable) return DefaultPort;   // 没人占用：保持 9222（向后兼容）
-
-            if (d.IsBrowser && (d.HasPanPage || IsOwnEndpoint(d, ownWs)))
+            // ===== 升级迁移：兼容 M7 之前的旧浏览器 =====
+            //
+            // M7 之前浏览器是用固定 9222（回退 9223-9233）启动的，那种浏览器**不会**
+            // 写 browser-profile\DevToolsActivePort。用户升级本程序时，旧浏览器往往
+            // 还在后台跑着（已登录、有 pan 页面），但上面的分支因为读不到
+            // DevToolsActivePort 直接返回 0 ⇒ 我们会**再启动一个**浏览器，同时
+            // EnsurePortResolved 又把 cdp-port.txt 删掉 ⇒ 引擎回退 9222 连上那个**旧的**，
+            // 于是"界面控制新浏览器、引擎操作旧浏览器"，上传必然失败。
+            // 实测症状：upload-runonce 两个文件全部 "无法进入目标文件夹"（PAGE）。
+            //
+            // 处理：探测旧固定端口；只有它确实是本应用 profile 的浏览器、且已经在
+            // 提供 pan 页面时才沿用（没有 uuid 证据，所以必须有 pan 页面才算，
+            // 避免把别人占住 9222 的浏览器认成自己的）。
+            var legacy = ProbePort(DefaultPort);
+            if (legacy.IsBrowser && legacy.HasPanPage)
             {
-                // 真浏览器，而且要么已经在服务 pan.xunlei.com（可能是用户手动起的），
-                // 要么能证明是本应用 profile 启动的 → 直接复用，不另起实例
+                _log("沿用一个旧版本（固定端口）启动的浏览器：" + DefaultPort
+                    + "。建议彻底退出本程序后删除 " + _profileDir + " 下的浏览器再重开，"
+                    + "即可切到随机端口模式。");
                 return DefaultPort;
             }
+            return 0;
+        }
 
-            // ---- 3) 9222 被本应用以外的程序占用 ----
-            _log("注意：9222 已被其他程序占用（" + Describe(d) + "），改用备用调试端口");
-            for (int p = FallbackPortFirst; p <= FallbackPortLast; p++)
+        /// <summary>
+        /// 启动后读 profile 的 DevToolsActivePort 拿真实端口（--remote-debugging-port=0 时由
+        /// 浏览器随机分配并写进这个文件），再写 cdp-port.txt 供引擎读取。读不到返回 0。
+        /// </summary>
+        private int AdoptLaunchedPort()
+        {
+            for (int i = 0; i < 60; i++)       // 最多约 12 秒
             {
-                var fb = ProbePort(p);
-                if (!fb.Reachable)
+                int p;
+                string ws;
+                ReadDevToolsActivePort(out p, out ws);
+                if (p > 0)
                 {
-                    _log("已切换到调试端口 " + p + "（原因：9222 不可用）");
+                    _port = p;
+                    _portResolved = true;
+                    WritePortFile(p);
+                    _log("调试端口 " + p + "（浏览器随机分配，仅 127.0.0.1）");
                     return p;
                 }
+                Thread.Sleep(200);
             }
-            _log("错误：9222 被其他程序占用，且 " + FallbackPortFirst + "-" + FallbackPortLast
-                + " 全部不可用，无法安全连接浏览器（不会去连不属于本应用的端口）");
-            return DefaultPort;
+            return 0;
         }
 
         private static string Describe(EndpointInfo info)
@@ -398,7 +427,10 @@ namespace ThunderPanSync
         /// </summary>
         public bool Ensure(bool showWindow)
         {
-            int port = CdpPort;
+            int port = CdpPort;         // 0 = 还没有浏览器（等下随机分配端口）
+
+            if (port > 0)
+            {
             var info = ProbePort(port);
 
             if (info.IsBrowser)
@@ -426,6 +458,7 @@ namespace ThunderPanSync
                 _log("拒绝连接：端口 " + port + " 上不是浏览器（" + Describe(info) + "），可能已被其他程序占用");
                 return false;
             }
+            }
 
             var exe = FindEdge();
             if (exe == null)
@@ -435,12 +468,17 @@ namespace ThunderPanSync
             }
 
             Directory.CreateDirectory(_profileDir);
-            _log("正在启动浏览器…（调试端口 " + port + "）");
+            _log("正在启动浏览器…（端口由浏览器随机分配，只绑 127.0.0.1）");
 
             var psi = new ProcessStartInfo();
             psi.FileName = exe;
             psi.Arguments =
-                "--remote-debugging-port=" + port + " " +
+                // M7：--remote-debugging-port=0 让浏览器自己挑一个空闲端口（随机），
+                // 之后从 browser-profile\DevToolsActivePort 读真实端口。固定端口可被猜、
+                // 可被抢占冒充（评审实测该链能造成静默丢数据）。
+                // ⚠ 永远不要加 --remote-debugging-address：那会把调试端口绑到
+                //   局域网/全网卡上，等于把"本机风险"升级成"整个网络风险"。
+                "--remote-debugging-port=0 " +
                 "--user-data-dir=\"" + _profileDir + "\" " +
                 "--no-first-run --no-default-browser-check " +
                 "--disable-blink-features=AutomationControlled " +
@@ -461,7 +499,14 @@ namespace ThunderPanSync
                 return false;
             }
 
-            // 等端口起来（最多 30 秒）。要求：真浏览器 + pan 页面都在（防冒充校验同时满足）
+            // 随机端口：先读 DevToolsActivePort 拿到实际端口（最多等约 12 秒）
+            if (AdoptLaunchedPort() <= 0)
+            {
+                _log("错误：浏览器已启动，但读不到它的调试端口（DevToolsActivePort 缺失或不可解析），无法连接");
+                return false;
+            }
+
+            // 再等端口真正可用（最多 30 秒）。要求：真浏览器 + pan 页面都在（防冒充校验同时满足）
             for (int i = 0; i < 60; i++)
             {
                 Thread.Sleep(500);
@@ -469,7 +514,7 @@ namespace ThunderPanSync
             }
             if (!IsDebugPortAlive())
             {
-                _log("浏览器启动超时（调试端口 " + port + " 上没有检测到 pan.xunlei.com 页面）");
+                _log("浏览器启动超时（调试端口 " + _port + " 上没有检测到 pan.xunlei.com 页面）");
                 return false;
             }
 

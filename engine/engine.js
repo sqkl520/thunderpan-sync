@@ -502,18 +502,39 @@ class SyncEngine extends EventEmitter {
       // 等待时间递增：页面刚上传完文件时列表刷新较慢，固定 2.5s 会偶发点不到
       await page.waitForTimeout(2500 + (i - 1) * 1500);
 
-      // 找不到链接时先滚动/等待再试，不要立刻判失败
-      const clicked = await page.evaluate((n) => {
-        const a = [...document.querySelectorAll('a[title]')].find(x => x.getAttribute('title') === n);
-        if (a) { a.scrollIntoView(); a.click(); return true; }
-        return false;
-      }, name).catch((e) => {
-        this.log('warn', `第 ${i} 次在页面里查找文件夹链接出错: ${e.message}`, 'PAGE');
-        return false;
-      });
+      // 轮询等目标链接真的出现，而不是只靠固定 sleep。
+      //
+      // 为什么必须轮询（实测故障）：goto() 在 document.readyState 变成 interactive
+      // 时就返回了，而 pan.xunlei.com 是 SPA —— interactive 时只有一个空壳，
+      // 文件列表要再等几秒才由前端渲染出来。于是在"刚启动的浏览器 / 冷缓存"
+      // 上，固定 2.5s 之后 querySelectorAll('a[title]') 仍然是 0 个，
+      // 4 次重试全部落空 ⇒ 每个文件都报 "无法进入目标文件夹"。
+      // 旧版本没暴露这个问题，是因为它总是复用同一个长期运行的浏览器，
+      // 页面早就渲染好了。改成随机端口后浏览器每次新起，冷页面成为常态。
+      //
+      // ⚠ 预算必须小：本函数在 **每个文件** 上传前都会被调用一次
+      // （uploadOne 里 enterRemoteFolder(true)）。轮询一旦给到几十秒，
+      // 一个文件失败就会吃掉整轮的时间预算（实测 4×20s 让 2 个文件的用例
+      // 直接撞上 300s 看门狗）。所以：首轮最多等 8 秒（覆盖 SPA 首屏渲染），
+      // 后面几轮各 4 秒（页面此时已经热了，只是列表刷新）。
+      let clicked = false;
+      const linkBudget = (i === 1) ? 8000 : 4000;
+      const linkDeadline = Date.now() + linkBudget;
+      while (Date.now() < linkDeadline) {
+        clicked = await page.evaluate((n) => {
+          const a = [...document.querySelectorAll('a[title]')].find(x => x.getAttribute('title') === n);
+          if (a) { a.scrollIntoView(); a.click(); return true; }
+          return false;
+        }, name).catch((e) => {
+          this.log('warn', `第 ${i} 次在页面里查找文件夹链接出错: ${e.message}`, 'PAGE');
+          return false;
+        });
+        if (clicked) break;
+        await page.waitForTimeout(800);
+      }
 
       if (!clicked) {
-        this.log('warn', `第 ${i} 次未找到 "${name}" 链接，重试`);
+        this.log('warn', `第 ${i} 次等待 ${linkBudget / 1000} 秒仍未找到 "${name}" 链接（页面可能没渲染完），重试`);
         await page.waitForTimeout(1500);
         continue;
       }

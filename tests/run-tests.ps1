@@ -291,7 +291,24 @@ $uploadNames = @('cdp-9222-endpoint', 'upload-runonce', 'upload-idempotent')
 
 if (-not $UnitOnly) {
     Write-Line ''
-    Write-Line '--- real upload cases (require a logged-in Edge on port 9222) ---'
+    # M7 (random CDP port): the browser no longer always listens on 9222. The app
+    # writes the real port to %APPDATA%\ThunderPanSync\cdp-port.txt. Without this
+    # the upload cases would SKIP forever even though a logged-in browser is up.
+    # Explicit TPS_CDP_PORT still wins, so manual runs can override.
+    if (-not $env:TPS_CDP_PORT) {
+        $portFile = Join-Path $env:APPDATA 'ThunderPanSync\cdp-port.txt'
+        if (Test-Path $portFile) {
+            $raw = ''
+            try { $raw = [IO.File]::ReadAllText($portFile) } catch { $raw = '' }
+            $raw = $raw.Trim().TrimStart([char]0xFEFF)
+            if ($raw -match '^\d{1,5}$') {
+                $env:TPS_CDP_PORT = $raw
+                Write-Line ('CDP port from cdp-port.txt: ' + $raw)
+            }
+        }
+        if (-not $env:TPS_CDP_PORT) { Write-Line 'no cdp-port.txt; upload cases will probe 9222' }
+    }
+    Write-Line '--- real upload cases (require a logged-in Edge; port from cdp-port.txt or 9222) ---'
     $uploadScript = Join-Path $scriptDir 'test-upload.js'
     $uploadResults = @(Invoke-NodeCases -ScriptPath $uploadScript -ScriptArgs @() -ExpectedNames $uploadNames -TimeoutSec $UploadTimeoutSec)
     for ($j = 0; $j -lt $uploadResults.Count; $j++) {
