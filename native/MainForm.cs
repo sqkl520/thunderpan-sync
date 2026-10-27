@@ -53,6 +53,10 @@ namespace ThunderPanSync
         private StatChip _chipDirs, _chipUploaded, _chipFailed, _chipLogin;
         private Label _lblProtocolErr, _lblHonesty, _lblHonestyTail, _lblProgress;
         private FlatProgress _flatProgress;
+        // 禁用态/空状态的解释用（项目之前完全没有 ToolTip 实例）
+        private ToolTip _tips;
+        // 文件夹列表为空时盖在上面的引导层（禁用控件的 ToolTip 不可靠，必须画出来）
+        private Panel _lvDirsHint;
         private Panel _failPanel;
         private Label _lblFail, _lblFailSummary;
         // ---- 唯一状态机（DECISIONS §五 A-1）----
@@ -703,6 +707,17 @@ namespace ThunderPanSync
             _btnStop = MakeButton("停止", 80);
             _btnOpenLog = MakeButton("打开日志文件", 120);
 
+            // 禁用态必须说明原因。
+            //
+            // 用户看到的只是一个灰掉的「开始自动备份」，界面上没有任何一处告诉
+            // 他"因为你还没添加文件夹"。实测反馈就是"这个按钮是怎么回事"。
+            // 灰按钮不给理由 = 用户以为功能坏了。
+            _tips = new ToolTip();
+            _tips.ShowAlways = true;              // 禁用控件也要能弹出
+            _tips.InitialDelay = 300;
+            _tips.ReshowDelay = 100;
+            _tips.AutoPopDelay = 12000;
+
             var bflow = new FlowLayoutPanel();
             bflow.Dock = DockStyle.Fill;
             bflow.FlowDirection = FlowDirection.LeftToRight;
@@ -755,7 +770,18 @@ namespace ThunderPanSync
             _lvDirs.Columns.Add("文件夹路径", 700);
             _lvDirs.FitColumns();
             _lvDirs.TabStop = false;   // 列表靠鼠标选；不自绘焦点框，不进 Tab 序列
+            _lvDirs.ShowItemToolTips = true;
+
+            // 空列表引导层（与列表同槽位、同高度、互斥显示 —— 见 ExplainDisabledButtons）
+            _lvDirsHint = new Panel();
+            _lvDirsHint.Dock = DockStyle.Top;
+            _lvDirsHint.Height = Theme.S(132);
+            _lvDirsHint.BackColor = Theme.BgSurfaceAlt;
+            _lvDirsHint.Paint += PaintDirsHint;
+
             page.Controls.Add(_lvDirs);
+            page.Controls.Add(_lvDirsHint);
+            _lvDirsHint.Visible = false;    // 初始由 ExplainDisabledButtons 决定
 
             // 添加 / 移除按钮行（高 42，padY 3 ⇒ 内容 36 ≥ FlatButton 34）
             var dirBtns = new Panel();
@@ -855,12 +881,15 @@ namespace ThunderPanSync
             // A-9：日志一显示就全文选中会整块变选中蓝（白像素 ×4）
             _txtLog.Select(0, 0);
 
-            // 页体内部 Z 序（DECISIONS §3.3）：Fill 占 0，Bottom 其次，Top 越靠前索引越大
+            // 页体内部 Z 序（DECISIONS §3.3）：Fill 占 0，Bottom 其次，Top 越靠前索引越大。
+            // 注意：Dock=Top 的控件之间，索引越大 = 越靠上。所以视觉顺序从下往上：
+            //   logPanel < _failPanel < dirBtns < _lvDirs < lbl
             page.Controls.SetChildIndex(logPanel, 0);
             page.Controls.SetChildIndex(_failPanel, 1);
             page.Controls.SetChildIndex(dirBtns, 2);
-            _pageMain.Controls.SetChildIndex(_lvDirs, 3);
-            _pageMain.Controls.SetChildIndex(lbl, 4);
+            _pageMain.Controls.SetChildIndex(_lvDirsHint, 3);
+            _pageMain.Controls.SetChildIndex(_lvDirs, 4);
+            _pageMain.Controls.SetChildIndex(lbl, 5);
         }
 
 
@@ -1804,6 +1833,61 @@ namespace ThunderPanSync
                 _chipLogin.Value = "已登录";
                 _chipLogin.ValueColor = Theme.Ok;
             }
+            ExplainDisabledButtons();
+        }
+
+        /// <summary>
+        /// 把"为什么点不动"说清楚。灰按钮不配理由，用户只会以为功能坏了。
+        /// ToolTip 用 ShowAlways=true，禁用的控件也能弹出。
+        /// </summary>
+        private void ExplainDisabledButtons()
+        {
+            // 空列表引导层：这是**唯一可靠**的"灰按钮为什么灰"的说明渠道。
+            // 禁用按钮的 ToolTip 实测不弹（收不到鼠标消息），所以引导必须可见。
+            //
+            // 引导层和列表必须**互斥**：两个都是 Dock=Top、高 132，同时可见会各占
+            // 一个槽位（总高 264），把下面的按钮行和日志区一起挤下去 —— 实测就是这个症状。
+            if (_lvDirsHint != null && _lvDirs != null)
+            {
+                bool show = (_stDirsCount == 0);
+                if (_lvDirsHint.Visible != show) _lvDirsHint.Visible = show;
+                if (_lvDirs.Visible != !show) _lvDirs.Visible = !show;
+                if (show) _lvDirsHint.Invalidate();
+            }
+            if (_tips == null) return;
+
+            string startWhy = "";
+            if (!_loggedIn) startWhy = "先点左边「登录迅雷云盘」，登录后才能开始自动上传。";
+            else if (_stDirsCount == 0) startWhy = "还没有添加要监视的文件夹。先点上面「添加文件夹…」，这个按钮就能用了。";
+            else if (!_btnStart.Enabled) startWhy = "当前状态不允许开始自动上传。";
+            try { _tips.SetToolTip(_btnStart, startWhy); } catch (Exception) { }
+
+            string syncWhy = "";
+            if (_uiState == UiState.Error) syncWhy = "引擎当前异常，先解决引擎问题再同步（见日志）。";
+            try { _tips.SetToolTip(_btnSync, syncWhy); } catch (Exception) { }
+
+            string stopWhy = (_uiState == UiState.Running || _roundActive)
+                ? "停止本轮上传，同时关闭自动备份。"
+                : "现在没有在传，不需要停。";
+            try { _tips.SetToolTip(_btnStop, stopWhy); } catch (Exception) { }
+        }
+
+        /// <summary>空文件夹列表的引导：这块地方是干什么的、下一步点哪里。</summary>
+        private void PaintDirsHint(object sender, PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            var r = ((Control)sender).ClientRectangle;
+            using (var b = new SolidBrush(Theme.BgSurfaceAlt)) g.FillRectangle(b, r);
+
+            int y = Theme.S(14);
+            Draw.TextLeft(g, "还没有监视的文件夹", Theme.FontSubtitle,
+                new Rectangle(Theme.S(12), y, r.Width - Theme.S(24), Theme.S(24)), Theme.TextPrimary);
+            y += Theme.S(28);
+            Draw.TextLeft(g, "点下面的「添加文件夹…」选一个目录，里面的文件会被自动上传到迅雷云盘。",
+                Theme.FontBody, new Rectangle(Theme.S(12), y, r.Width - Theme.S(24), Theme.S(22)), Theme.TextSecondary);
+            y += Theme.S(24);
+            Draw.TextLeft(g, "加完文件夹之后，右下角的「开始自动备份」才会变成可点（现在它是灰的，就是因为它需要一个目录）。",
+                Theme.FontBody, new Rectangle(Theme.S(12), y, r.Width - Theme.S(24), Theme.S(22)), Theme.TextTertiary);
         }
 
         private void DoPrimary()
